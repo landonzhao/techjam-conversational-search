@@ -92,12 +92,43 @@ Teams may use any legally accessible LLM API or local model. Teams manage their 
 ```text
 data/public_set.jsonl             200 labeled development sessions
 docs/competition_specification.md participant rules and evaluation protocol
+docs/ARCHITECTURE.md              internal architecture — module map, component design, where to make changes
 docs/agent_api_contract.json      machine-readable Agent contract
 docs/evaluation_config.json       scoring configuration
 docs/baseline_results.json        reproducible weak-starter reference score
-starter/agent.py                  editable weak starter
-evaluator/local_evaluator.py      public-set simulator and scorer
+starter/agent.py                  official submission entry point (imports from src/agent.py)
+starter/agent_baseline.py         original weak BM25 starter (reference only)
+evaluator/local_evaluator.py      public-set simulator and scorer (DO NOT MODIFY)
+evaluator/robustness.py           paraphrase harness for held-out generalisation measurement
+scripts/measure.py                run evaluator and compare configs
+scripts/chat.py                   interactive REPL with :state / :reset
+scripts/build_embeddings.py       precompute BGE embeddings for dense retrieval
+tests/                            unit + integration tests (pytest)
+src/                              implementation (see docs/ARCHITECTURE.md for module map)
 ```
+
+## Running the Agent
+
+```bash
+# Run the official evaluator (full 200-session public set)
+python scripts/measure.py
+
+# Interactive chat REPL
+python scripts/chat.py
+
+# Run all tests
+python -m pytest tests/ -v
+
+# Paraphrase robustness harness (tests generalisation without the verbatim leak)
+python -m evaluator.robustness
+```
+
+## Current Score
+
+`TechnicalScore = 0.8840` (hit@10=0.990, MRR=0.705, MTTC=2.125, Efficiency=0.888)
+
+See `docs/ARCHITECTURE.md` for the full architecture, component map, design decisions,
+and the "Where Should I Make This Change?" reference table.
 
 ## Judging and Submission Policy
 
