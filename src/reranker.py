@@ -25,13 +25,17 @@ MATERIAL_RE = re.compile(
 )
 
 SYSTEM_PROMPT = (
-    "You are matching a shopper to the ONE specific product they are describing in a "
-    "clothing, shoes and jewelry store. You are given the shopper's stated constraints "
-    "and a numbered list of candidate products with their attributes. Score how well "
-    "EACH candidate matches the shopper's hard constraints (material, type, distinctive "
-    "features); soft preferences break ties. Reward exact attribute matches; penalize a "
-    "wrong product type or wrong material. Return ONLY a JSON object mapping candidate "
-    'number to a 0-100 match score, e.g. {"0": 95, "1": 40}. No prose.'
+    "You are an expert personal shopper for a clothing, shoes and jewellery store. The "
+    "customer is looking for ONE specific product. You are given their stated constraints "
+    "and a numbered list of candidate products with their attributes.\n\n"
+    "Choose the best match, paying attention to the attributes that DIFFERENTIATE "
+    "otherwise-similar products (model/version, pattern, silhouette, cut, distinctive "
+    "features) — these matter more than attributes all candidates share. Hard constraints "
+    "(material, product type, explicit features) must be satisfied; a wrong product type or "
+    "wrong material disqualifies a candidate. Do not reward popularity or brand fame — judge "
+    "only fit to the customer's description.\n\n"
+    'Return ONLY JSON: {"order": [best..worst candidate numbers], "why": "<=15 words on the '
+    'top pick"}. Every candidate number must appear exactly once in "order". No prose.'
 )
 
 
@@ -106,17 +110,17 @@ class LLMReranker:
         return f"{idx}. {title} | type: {cat} | material: {material} | {feat_s} | {price_s}"
 
     def rerank(self, conversation: list[str], asins: list[str], top_k: int, depth: int = 20) -> list[str]:
-        """Score-based rerank: LLM scores each candidate 0-100; we sort by score,
-        breaking ties by the incoming (strong) order. Fail-safe to input order."""
+        """Listwise rerank: the LLM returns candidates ordered best-to-worst; we apply that
+        permutation to the head and keep the tail as-is. Fail-safe to input order."""
         if not self.available or not asins:
             return asins
         head = asins[:depth]
         constraints = self._clean_constraints(conversation)
         listing = "\n".join(self._candidate_line(i, a) for i, a in enumerate(head))
         prompt = (
-            f"Shopper's constraints (most recent first):\n{constraints}\n\n"
+            f"Customer's constraints (most recent first):\n{constraints}\n\n"
             f"Candidates:\n{listing}\n\n"
-            f'Return {{"number": score}} for every candidate 0-{len(head)-1}.'
+            f'Order all candidates 0-{len(head)-1} best to worst.'
         )
         try:
             resp = self._pool.generate_content(
@@ -125,21 +129,19 @@ class LLMReranker:
                 config=self._pool.types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     temperature=0.0,
-                    max_output_tokens=1024,
+                    max_output_tokens=512,
                     response_mime_type="application/json",
                 ),
             )
-            scores = self._parse_scores(resp.text, len(head))
+            order = self._parse_order(resp.text, len(head))
             usage = getattr(resp, "usage_metadata", None)
             if usage:
                 self.prompt_tokens += int(getattr(usage, "prompt_token_count", 0) or 0)
                 self.completion_tokens += int(getattr(usage, "candidates_token_count", 0) or 0)
         except Exception:
             return asins  # fail safe
-        if not scores:
+        if not order:
             return asins
-        # sort head by (LLM score desc, original rank asc); keep tail as-is
-        order = sorted(range(len(head)), key=lambda i: (-scores.get(i, -1.0), i))
         reordered = [head[i] for i in order] + asins[depth:]
         return reordered
 
@@ -161,20 +163,34 @@ class LLMReranker:
         return "\n".join(reversed(lines)) or "- (no specific constraints yet)"
 
     @staticmethod
-    def _parse_scores(text: str, n: int) -> dict[int, float]:
+    def _parse_order(text: str, n: int) -> list[int]:
+        """Parse the listwise {"order": [...]} permutation. Defensive: dedupes, drops
+        out-of-range indices, and appends any candidates the model omitted (in original
+        order) so the result is always a full valid permutation of 0..n-1."""
         if not text:
-            return {}
+            return []
+        raw: list = []
         try:
             data = json.loads(text)
-            if isinstance(data, dict):
-                out = {}
-                for k, v in data.items():
-                    if str(k).strip().lstrip("-").isdigit():
-                        try:
-                            out[int(k)] = float(v)
-                        except (TypeError, ValueError):
-                            pass
-                return out
+            if isinstance(data, dict) and isinstance(data.get("order"), list):
+                raw = data["order"]
+            elif isinstance(data, list):
+                raw = data
         except Exception:
-            pass
-        return {}
+            m = re.search(r'\[([0-9,\s]+)\]', text)
+            if m:
+                raw = [p for p in m.group(1).split(",")]
+        seen: set[int] = set()
+        order: list[int] = []
+        for x in raw:
+            try:
+                i = int(x)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= i < n and i not in seen:
+                seen.add(i)
+                order.append(i)
+        if not order:
+            return []
+        order.extend(i for i in range(n) if i not in seen)  # append omitted, original order
+        return order

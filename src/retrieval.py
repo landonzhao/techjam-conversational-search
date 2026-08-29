@@ -68,6 +68,7 @@ class VectorRetriever:
         self.embeddings = np.load(emb_path)   # (N, 384) float32, L2-normalised
         self.asins: list[str] = json.loads(Path(asins_path).read_text(encoding="utf-8"))
         self.model = SentenceTransformer(model_name)
+        self._asin_index: dict[str, int] = {a: i for i, a in enumerate(self.asins)}
 
     def search(self, query: str, top_n: int) -> list[str]:
         """Encode query, return top_n ASINs by cosine similarity."""
@@ -95,6 +96,23 @@ class VectorRetriever:
         if norm > 0:
             combined /= norm
         return self._top(combined, top_n)
+
+    def phrase_similarities(self, phrases: list[str], asins: list[str]) -> dict[str, float]:
+        """Max cosine similarity between any phrase embedding and each candidate's embedding.
+
+        Used by CoverageReranker for semantic (paraphrase-tolerant) constraint scoring.
+        Phrases are encoded with the same query prefix used for retrieval.
+        """
+        if not phrases or not asins:
+            return {}
+        vecs = self.model.encode(
+            [EMBED_QUERY_PREFIX + p for p in phrases], normalize_embeddings=True
+        ).astype("float32")  # (P, D)
+        result: dict[str, float] = {}
+        for asin in asins:
+            idx = self._asin_index.get(asin)
+            result[asin] = float((vecs @ self.embeddings[idx]).max()) if idx is not None else 0.0
+        return result
 
     def _top(self, vec, top_n: int) -> list[str]:
         scores = self.embeddings @ vec

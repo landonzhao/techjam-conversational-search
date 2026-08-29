@@ -563,6 +563,12 @@ class QuestionSelector:
             attr = self._distinctive_attr(belief.top_asin, head)
             if attr:
                 return attr, self._confirm_phrase(attr, belief.top_asin)
+        # When top candidates are nearly tied, a product comparison question is more
+        # discriminating than asking about an abstract attribute.
+        if belief.margin < 0.15 and len(head) >= 2:
+            cmp = self._comparison_phrase(head)
+            if cmp:
+                return "other", cmp
         # guidance multiplier is per-slot learned info-gain weight (1.0 when unseen)
         unc = belief.attr_uncertainty
         if unc:
@@ -626,6 +632,23 @@ class QuestionSelector:
     def _confirm_phrase(self, attr: str, top: str) -> str:
         tv = attr_value(self.catalog.get(top, {}), attr, self.doc(top), self.price_q)
         return f"The closest match is {tv} — is that what you want, or something different?"
+
+    def _comparison_phrase(self, head: list[str]) -> str | None:
+        """When top candidates are nearly tied, ask a direct product comparison question.
+
+        More discriminating than abstract attribute questions when the top-2 differ on
+        multiple dimensions simultaneously — the shopper names their preference directly.
+        """
+        a1, a2 = head[0], head[1]
+        t1 = str(self.catalog.get(a1, {}).get("title") or "")
+        t2 = str(self.catalog.get(a2, {}).get("title") or "")
+        if not t1 or not t2 or t1[:40] == t2[:40]:
+            return None
+        p1 = self.catalog.get(a1, {}).get("price")
+        p2 = self.catalog.get(a2, {}).get("price")
+        desc1 = f"{t1[:50]}" + (f" (${p1:.0f})" if p1 else "")
+        desc2 = f"{t2[:50]}" + (f" (${p2:.0f})" if p2 else "")
+        return f"Are you looking for something more like '{desc1}' or '{desc2}'?"
 
 
 class RationaleBuilder:

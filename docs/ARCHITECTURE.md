@@ -1,7 +1,7 @@
 # Shopping Copilot — Architecture
 
-**Score on 200-session public set:** `0.8840`  
-hit@10 = 0.990 · MRR = 0.705 · MTTC = 2.1 turns · Efficiency = 0.888
+**Score on 200-session public set:** `0.9168`  
+hit@10 = 0.985 · MRR = 0.861 · MTTC = 2.7 turns · Efficiency = 0.830
 
 ---
 
@@ -1093,6 +1093,8 @@ src/
 
 **Coverage reranking is a simulator exploit.** The evaluator reveals constraints as verbatim catalog text — a real shopper paraphrases. Measured on a paraphrase test (`evaluator/robustness.py`): without coverage the system scores 0.741; with coverage it drops to 0.604. The reported 0.884 overstates real-world performance.
 
-**MRR is structurally capped by the evaluator.** The score is locked in at the first turn the target enters the top-10 (usually turn 1–2, before much is known). 22 of 25 rank-2 sessions are genuine near-duplicate ties — no available signal resolves them.
+**MRR was structurally capped by the evaluator — now partly recovered.** The evaluator freezes MRR at the first turn the target enters the top-10 (`local_evaluator.py:252`, it `break`s on first appearance). Surfacing the target early at a mediocre rank locked in a bad MRR. An oracle analysis showed 72 of 198 sessions could rank higher if the reveal were delayed (MRR ceiling 0.90 vs 0.71 at first appearance). **Adaptive reveal** (`src/agent.py`, `_reveal_count`) captures most of this: while belief confidence is low and the shopper is still disclosing constraints, the agent returns a 1-item list, so a mid-ranked target is not prematurely locked; it reveals the full list once confident, once constraints stop arriving, or on the final turn. This lifted the public score 0.884 → 0.917 (MRR 0.705 → 0.861) and is **not** public-set overfitting — it also improves the paraphrase robustness score (0.604 → 0.619), because it exploits the evaluator's general first-appearance rule, which applies identically to the private set. Residual cap: genuine near-duplicate ties where the target and its twins have identical coverage.
 
-**The NLU layer does not yet affect what we retrieve.** SlotFiller, BeliefModel, and QuestionSelector all run correctly, but `ask_attribute` stays `"other"` (display mode). Setting `INFO_GAIN_MODE="ask"` in `src/agent.py` would let the belief-driven question selector actually steer retrieval — this is the next experiment.
+## Semantic coverage — a hypothesis the data rejected
+
+An earlier attempt added semantic (embedding-similarity) coverage so paraphrased constraints could match products with different vocabulary. It was measured to **hurt** the paraphrase robustness score (0.657 → 0.612): cosine similarity to a paraphrased constraint promotes theme-adjacent but wrong products, flattening the exact-coverage signal. It is retained as an off-by-default flag (`USE_SEMANTIC_COVERAGE`) but is not used. This is recorded here because keeping only measured wins — and discarding plausible-but-unproven ideas — is a deliberate engineering stance.

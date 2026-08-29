@@ -19,4 +19,12 @@ tests/test_organizer_pipeline.py
 cache/
 .env
 *.npy
+# Generated evaluation artifacts (reproducible via scripts/, so not tracked).
+data/synthetic_set.jsonl
+data/synthetic_*.jsonl
+data/test_suite/
+traces/
 starter/agent_baseline.py
+CLAUDE.md
+.claude/
+.idea/
