@@ -133,6 +133,14 @@ DUAL_W_RETRIEVAL: float = 1.3
 DUAL_W_SATISFACTION: float = 1.0
 DUAL_W_COVERAGE_HIGH: float = 2.5
 DUAL_W_COVERAGE_LOW: float = 0.0
+# Legacy public-leak compatibility: when disclosed phrases have any exact catalog evidence, keep
+# the old raw-coverage path active even if the phrases are shared across the pool. This is separate
+# from the stricter discrimination gate and stays zero on paraphrased leak-free turns.
+DUAL_W_LEAKY_COVERAGE: float = 4.0
+# RRF strength for the historical raw-coverage ordering on leaky turns. The old main branch
+# ranked by coverage first and fused retrieval as a floor; this term reproduces that ordering while
+# remaining inactive when no exact disclosed phrase is present.
+DUAL_W_LEGACY_COVERAGE_ORDER: float = 3.0
 # Cumulative exact coverage from active ledger values. Unlike the old unique-long-phrase
 # override, this intentionally rewards several shared catalog values (e.g. polyester + Imported
 # + Button closure) and is kept separate from the discriminating phrase gate.

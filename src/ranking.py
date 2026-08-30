@@ -710,6 +710,8 @@ class DualTrackRanker:
         w_sat: float = 1.0,
         w_cov_high: float = 2.5,
         w_cov_low: float = 0.0,
+        w_leaky: float = 0.0,
+        w_legacy_order: float = 0.0,
         w_cumulative: float = 0.0,
         raw_message: str | None = None,
         raw_ngram_bonus: float = 0.0,
@@ -752,7 +754,32 @@ class DualTrackRanker:
         coverage = self._normalize(exact)
         gate, gate_stats = self._coverage_gate(
             asins, phrases, exact, min_exact_matches, discrimination_min, shared_max)
-        w_cov = w_cov_high if gate else w_cov_low
+        # ``origin/main``'s public strength came from always sorting on raw verbatim coverage,
+        # even when several candidates shared the same boilerplate. Restore that path only when a
+        # current-turn disclosed phrase has exact catalog evidence; paraphrased turns have no such
+        # evidence and retain the semantic/retrieval track unchanged.
+        # A tiny one-token or one-phrase overlap is common in paraphrased honest turns. Require
+        # multiple complete disclosed phrases on one candidate before restoring the legacy public
+        # leak path; ordinary semantic turns therefore keep the P1/P2 behavior.
+        exact_counts = self.coverage.exact_match_counts(asins, phrases)
+        leaky_evidence = bool(phrases) and max(exact_counts.values(), default=0) >= 2
+        w_cov_gate = w_cov_high if gate else w_cov_low
+        w_cov = max(w_cov_gate, w_leaky if leaky_evidence else 0.0)
+        legacy_order: list[str] = []
+        legacy_rank: dict[str, float] = {asin: 0.0 for asin in asins}
+        if leaky_evidence and w_legacy_order > 0:
+            # Reuse the main-branch coverage sorter: raw token/phrase coverage first, popularity
+            # as tie-break, and RRF with the incoming retrieval order as a bounded floor.
+            legacy_order, _legacy_scores = self.coverage.rerank_scored(
+                asins,
+                phrases,
+                pop_blend=COVERAGE_POP_BLEND,
+                retrieval_weight=1.0,
+            )
+            legacy_rank = {
+                asin: self._rank_score(index, len(legacy_order))
+                for index, asin in enumerate(legacy_order)
+            }
         cumulative = self.coverage.cumulative_exact_scores(asins, constraints)
         raw_overlap = self.coverage.raw_ngram_bonus_scores(
             asins, raw_message, bonus_per_match=raw_ngram_bonus)
@@ -761,6 +788,7 @@ class DualTrackRanker:
                 max(0.0, w_ret) * retrieval[asin]
                 + max(0.0, w_sat) * sat.get(asin, 0.0)
                 + max(0.0, w_cov) * coverage.get(asin, 0.0)
+                + max(0.0, w_legacy_order) * legacy_rank.get(asin, 0.0)
                 + max(0.0, w_cumulative) * cumulative.get(asin, 0.0)
                 + max(0.0, raw_overlap.get(asin, 0.0))
                 + max(0.0, popularity_weight) * popularity.get(asin, 0.0)
@@ -791,6 +819,10 @@ class DualTrackRanker:
             "popularity": popularity,
             "final": final,
             "coverage_weight": float(w_cov),
+            "coverage_gate_weight": float(w_cov_gate),
+            "leaky_coverage_active": leaky_evidence,
+            "legacy_coverage_order": legacy_rank,
+            "legacy_coverage_order_weight": float(max(0.0, w_legacy_order)),
             "cumulative_coverage_weight": float(max(0.0, w_cumulative)),
             "raw_ngram_bonus_per_match": float(max(0.0, raw_ngram_bonus)),
             "coverage_gate": gate,

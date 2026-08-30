@@ -378,6 +378,18 @@ class DualTrackRankerTest(unittest.TestCase):
         self.assertEqual(order[0], "T")
         self.assertGreater(details["coverage_weight"], 0.0)
 
+    def test_shared_exact_evidence_activates_legacy_leaky_coverage(self):
+        ranker = self._ranker()
+        order, details = ranker.rank(
+            ["B", "T", "S"], ["zephyr corduroy", "jacket"],
+            w_ret=0.0, w_sat=0.0, w_cov_high=0.0, w_cov_low=0.0,
+            w_leaky=4.0, popularity_weight=0.0,
+            min_exact_matches=2, discrimination_min=0.99, shared_max=0.01,
+        )
+        self.assertTrue(details["leaky_coverage_active"])
+        self.assertEqual(details["coverage_weight"], 4.0)
+        self.assertEqual(order[0], "T")
+
     def test_flat_coverage_preserves_retrieval_order_and_unknown_sparse_item(self):
         order, details = self._ranker().rank(
             ["S", "B", "T"], ["ribbed velvety fabric"],

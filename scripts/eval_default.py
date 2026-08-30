@@ -43,6 +43,7 @@ def main() -> None:
         f"retrieval_weight={agent.DUAL_W_RETRIEVAL}  "
         f"retrieval_guard_k={agent.DUAL_RETRIEVAL_GUARD_K}  "
         f"coverage_high={agent.DUAL_W_COVERAGE_HIGH}  "
+        f"leaky_coverage={agent.DUAL_W_LEAKY_COVERAGE}  "
         f"cumulative_coverage={agent.DUAL_W_CUMULATIVE_COVERAGE}  "
         f"raw_ngram_bonus={agent.DUAL_RAW_NGRAM_BONUS}",
         flush=True,

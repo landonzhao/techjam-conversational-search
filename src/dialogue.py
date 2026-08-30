@@ -142,7 +142,7 @@ class ConversationState:
         self.message_turns.append(turn if turn is not None else len(self.all_text))
 
     def query_text(self) -> str:
-        """Return only active positive ledger values and the current category anchor.
+        """Return only the active positive ledger values and the current category anchor.
 
         Raw transcript text remains in ``all_text`` for audit and optional response generation,
         but it is never a retrieval input. Negative values are handled by ``apply_negatives`` and
