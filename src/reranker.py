@@ -40,6 +40,10 @@ SYSTEM_PROMPT = (
     "(material, product type, explicit features) must be satisfied; a wrong product type or "
     "wrong material disqualifies a candidate. Do not reward popularity or brand fame — judge "
     "only fit to the customer's description.\n\n"
+    "PRIMARY objective: put the single best-fitting product first. SECONDARY (only to break ties "
+    "among near-equal fits): when two candidates are near-duplicates, keep the better-described one "
+    "higher and push the redundant twin down, so the top slots show distinct options — but never "
+    "demote a genuinely better match for the sake of variety.\n\n"
     'Return ONLY JSON: {"order": [best..worst candidate numbers], "why": "<=15 words on the '
     'top pick"}. Every candidate number must appear exactly once in "order". No prose.'
 )

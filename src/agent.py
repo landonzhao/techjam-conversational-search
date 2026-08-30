@@ -17,11 +17,16 @@ from src.config import (
     COVERAGE_DISCRIMINATION_PCTL, COVERAGE_INFORMATIVE_MIN, COVERAGE_PREFIX_BONUS,
     COVERAGE_PREFIX_CHARS, SUPPRESS_POP_ON_PARAPHRASE,
     COVERAGE_RETRIEVAL_WEIGHT, DIVERSITY_HEAD_KEEP, DIVERSITY_LAMBDA, EXPANSION_WEIGHT,
+    CE_BETA, CE_CONVEX_GATE_MARGIN, USE_CE_CONVEX, USE_NL_CONSTRAINTS,
     LLM_RERANK_DEPTH, LLM_WEIGHT, POOL_BY_PHASE, POOL_NO_PERSONALIZATION, POOL_SIZE,
     PRICE_PROXIMITY_WEIGHT, RERANK_NEAR_TIE_MARGIN, REVEAL_CONFIDENCE, REVEAL_HOLDBACK_K,
-    SATISFACTION_POP_WEIGHT, SATISFACTION_SEM_ALPHA, SATISFACTION_SPECIFICITY_REF,
+    SATISFACTION_POP_CHANNEL, SATISFACTION_POP_WEIGHT, SATISFACTION_QUALITY_CHANNEL,
+    SATISFACTION_SEM_ALPHA, SATISFACTION_SEM_GATE_HIGH, SATISFACTION_SEM_GATE_LOW,
+    SATISFACTION_SPECIFICITY_REF,
     SEMANTIC_COVERAGE_GATE, SEMANTIC_COVERAGE_WEIGHT, SESSION_MAX_TURNS,
-    SLOT_DECAY, STRUCTURED_COVERAGE_WEIGHT, USE_ADAPTIVE_CLARIFY, USE_SATISFACTION_RANKER,
+    LTR_MODEL_PATH, SLOT_DECAY, STRUCTURED_COVERAGE_WEIGHT, USE_ADAPTIVE_CLARIFY,
+    USE_CATEGORY_GATE, USE_LTR,
+    USE_SATISFACTION_RANKER,
 )
 from src.context_engine import (
     ContextDistiller, GuidanceLearner, OrchestrationPolicy, ProfileService,
@@ -31,12 +36,12 @@ from src.dialogue import (
     next_ask, phase_transition,
 )
 from src.ranking import CoverageReranker, Diversifier, NeedSatisfactionScorer, Personalizer
-from src.retrieval import VectorRetriever, rrf, vector_weight
+from src.retrieval import VectorRetriever, convex_fuse, rrf, vector_weight
 from src.trace import Tracer, get_tracer
 from src.understanding import (
     Belief, BeliefModel, CatalogVocab, ExpansionTable, NeedModel,
     QuestionSelector, RationaleBuilder, SlotFiller, UseCaseInferencer,
-    apply_negatives, converge, missing_required,
+    apply_category_gate, apply_negatives, converge, missing_required,
 )
 from src.keys import GeminiClientPool
 from src.llm_inference import LLMResponseGenerator, LLMSlotExtractor, SmartUseCaseInferencer
@@ -111,6 +116,14 @@ class Agent:
     SATISFACTION_SEM_ALPHA = SATISFACTION_SEM_ALPHA
     SATISFACTION_POP_WEIGHT = SATISFACTION_POP_WEIGHT           # Phase 2: adaptive popularity
     SATISFACTION_SPECIFICITY_REF = SATISFACTION_SPECIFICITY_REF
+    # Multi-channel prior weights (popularity / average-rating quality) + per-candidate semantic gate
+    # thresholds (above HIGH the popularity prior is silenced). Teammate branch-ranking.
+    SATISFACTION_POP_CHANNEL = SATISFACTION_POP_CHANNEL
+    SATISFACTION_QUALITY_CHANNEL = SATISFACTION_QUALITY_CHANNEL
+    SATISFACTION_SEM_GATE_LOW = SATISFACTION_SEM_GATE_LOW
+    SATISFACTION_SEM_GATE_HIGH = SATISFACTION_SEM_GATE_HIGH
+    USE_LTR = USE_LTR                                           # learned re-ranker (off; experimental)
+    LTR_MODEL_PATH = LTR_MODEL_PATH
     # Fix 3 — cap the popularity term so ultra-popular lookalikes cannot bury a low-pop target.
     COVERAGE_POP_CAP = COVERAGE_POP_CAP
     # MMR diversity: freshens the list for real fashion browsing, but measured to cost
@@ -129,12 +142,24 @@ class Agent:
     SEMANTIC_COVERAGE_GATE = SEMANTIC_COVERAGE_GATE
     USE_NEG_DOWNWEIGHT = False      # measured −0.027; off
     USE_CATEGORY_TIEBREAK = False   # measured −0.019; off
+    # Hard-constraint category gate (roadmap #2): demote wrong-category lookalikes after ranking.
+    # Off by default (public-leak risk); wired for shadow-suite validation. See config.
+    USE_CATEGORY_GATE = USE_CATEGORY_GATE
     # ON: retrieve-then-rerank precision fix. Neutral on the leaky public set (coverage already wins
     # there, -0.016), but a large win on honest/reworded input where the bi-encoder can't resolve the
     # exact item among look-alikes: pillar_free 0.46 -> 0.66 (MRR 0.31 -> 0.59). Local, offline, $0.
     USE_CROSS_ENCODER = True
     CE_DEPTH = CE_DEPTH
     CE_WEIGHT = CE_WEIGHT
+    # OPTIONAL (OFF, PROMISING—ITERATE): score-aware CE fusion (exp CE-FUSION-01). Convex-combine
+    # min-max-normalized satisfaction + CE scores instead of rank-only RRF, using the CE's precision
+    # magnitude, not just its order. Big honest win (leak-free MRR +0.060, pillar_free +0.096 at
+    # β=0.6) but regresses public (TechScore −0.0068 at β=0.6) — the MS-MARCO CE dilutes the leaky
+    # verbatim signal. Off until a GATED variant (fire only on paraphrase turns) removes the public
+    # cost. False → legacy RRF fusion (the shipped default).
+    USE_CE_CONVEX = USE_CE_CONVEX
+    CE_BETA = CE_BETA
+    CE_CONVEX_GATE_MARGIN = CE_CONVEX_GATE_MARGIN
     USE_LLM_RERANK = False          # Gemini reranker; off (rate-limited)
     LLM_RERANK_DEPTH = LLM_RERANK_DEPTH
     LLM_WEIGHT = LLM_WEIGHT
@@ -143,6 +168,10 @@ class Agent:
     RERANK_NEAR_TIE_MARGIN = RERANK_NEAR_TIE_MARGIN
 
     # Dialogue / NLU
+    # Natural-language constraint capture: feed the structured NeedModel to the ranker when the
+    # shopper used natural language (no simulator marker), so the ranker fires on real language
+    # instead of falling back to raw retrieval order. Guarded to marker-absent turns. See config.
+    USE_NL_CONSTRAINTS = USE_NL_CONSTRAINTS
     USE_NEED_MODEL = True
     USE_ACTIVE_CONVERGENCE = True
     USE_INFO_GAIN_QUESTION = True
@@ -221,10 +250,23 @@ class Agent:
 
         # Alternate ranker (docs/RANKING_REDESIGN.md Phase 1): satisfaction = generalized coverage
         # with a semantic term. Shares the CoverageReranker's cached text/IDF and the vector store.
-        self._satisfaction = NeedSatisfactionScorer(
-            self._coverage, vector=self._vector, sem_alpha=self.SATISFACTION_SEM_ALPHA,
-            pop_weight=self.SATISFACTION_POP_WEIGHT,
-            specificity_ref=self.SATISFACTION_SPECIFICITY_REF)
+        # Build via refresh_satisfaction_scorer so runtime SATISFACTION_* overrides (from sweep
+        # harnesses / eval_matrix) rebuild the scorer without recreating the agent.
+        self._satisfaction: NeedSatisfactionScorer | None = None
+        self.refresh_satisfaction_scorer()
+
+        # Learned re-ranker (off by default): loads a trained linear model if present.
+        self._ltr = None
+        if self.USE_LTR:
+            try:
+                import os
+                from src.ranking_features import LTRModel, RankingFeatures
+                if os.path.exists(self.LTR_MODEL_PATH):
+                    self._ltr = LTRModel(
+                        self.LTR_MODEL_PATH,
+                        RankingFeatures(self._catalog.products, self._coverage))
+            except Exception:
+                self._ltr = None
 
         self._cross_encoder = None
         if self.USE_CROSS_ENCODER:
@@ -257,6 +299,33 @@ class Agent:
         # with its sample_id / ground truth. See src/trace.py.
         self._tracer: Tracer = get_tracer()
         self._pending_meta: dict | None = None
+
+    # ------------------------------------------------------------------ runtime rewiring
+    def refresh_satisfaction_scorer(self) -> NeedSatisfactionScorer:
+        """(Re)build `_satisfaction` from the current SATISFACTION_* attributes.
+
+        The scorer captures its knobs into instance state at construction, so mutating
+        `agent.SATISFACTION_*` after __init__ does NOT reach the already-built scorer. Sweep
+        harnesses must call this after any override so the new values take effect on the next
+        `respond()`. Cheap: the scorer holds only references to the shared coverage/vector components.
+        """
+        self._satisfaction = NeedSatisfactionScorer(
+            self._coverage, vector=self._vector,
+            sem_alpha=self.SATISFACTION_SEM_ALPHA,
+            pop_weight=self.SATISFACTION_POP_WEIGHT,
+            specificity_ref=self.SATISFACTION_SPECIFICITY_REF,
+            pop_channel=self.SATISFACTION_POP_CHANNEL,
+            quality_channel=self.SATISFACTION_QUALITY_CHANNEL,
+            sem_gate_low=self.SATISFACTION_SEM_GATE_LOW,
+            sem_gate_high=self.SATISFACTION_SEM_GATE_HIGH,
+        )
+        return self._satisfaction
+
+    @property
+    def satisfaction_scorer(self) -> NeedSatisfactionScorer:
+        """Public alias for the internal `_satisfaction` (used by tests / sweep scripts)."""
+        assert self._satisfaction is not None, "satisfaction scorer not initialised"
+        return self._satisfaction
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         state = ConversationState(user_profile=user_profile)
@@ -361,6 +430,7 @@ class Agent:
 
         pool = self._pool_size(state)
         candidates = self._retrieve(state, pool)
+        retrieval_order = list(candidates)   # original fused order, for the LTR retrieval_rank feature
         state.last_pool = len(candidates)
         self._tracer.stage("retrieval", pool_size=pool, candidates_returned=len(candidates))
 
@@ -395,24 +465,36 @@ class Agent:
                 if nums:
                     budget_val = (float(nums[0]) + float(nums[-1])) / 2  # midpoint covers ranges
                     break
-        if self.USE_SATISFACTION_RANKER and state.constraint_phrases:
-            # Alternate ranker (RANKING_REDESIGN.md Phase 1): rank by satisfaction of the raw
-            # constraint phrases (verbatim-lexical OR semantic), generalizing coverage. Replaces the
-            # coverage re-sort entirely when on; measured head-to-head via scripts/eval_matrix.py.
+        # Natural-language capture: when the shopper used no simulator marker, constraint_phrases is
+        # empty and the ranker would no-op (falling back to raw retrieval order). Feed the structured
+        # NeedModel positive values as ranking phrases so the ranker fires on real language. Guarded
+        # to marker-absent turns, so evaluator/paraphrase sets (which carry the marker) are unchanged.
+        rank_phrases = list(state.constraint_phrases)
+        nl_phrases = False
+        if self.USE_NL_CONSTRAINTS and not rank_phrases:
+            rank_phrases = self._nl_rank_phrases(state)
+            nl_phrases = True
+
+        if self.USE_SATISFACTION_RANKER and rank_phrases:
+            # Alternate ranker (RANKING_REDESIGN.md Phase 1): rank by satisfaction of the disclosed
+            # phrases (verbatim-lexical OR semantic), generalizing coverage. Replaces the coverage
+            # re-sort entirely when on; measured head-to-head via scripts/eval_matrix.py.
+            # On NL-derived (generic regex) phrases, suppress popularity so ties fall back to the
+            # retrieval order — otherwise fame buries a well-retrieved but unpopular target.
             candidates, cov_scores = self._satisfaction.rank(
-                candidates, state.constraint_phrases)
+                candidates, rank_phrases, pop_weight=0.0 if nl_phrases else None)
             if self._tracer.enabled:
                 self._tracer.note("satisfaction rerank on phrases: "
-                                  + "; ".join(state.constraint_phrases[:6]))
+                                  + "; ".join(rank_phrases[:6]))
         elif self.USE_COVERAGE_RERANK and (
-                state.constraint_phrases or struct_constraints or budget_val is not None):
+                rank_phrases or struct_constraints or budget_val is not None):
             prefer_cat = state.need.category if self.USE_CATEGORY_TIEBREAK else None
             sem_scores: dict[str, float] | None = None
             if self.USE_SEMANTIC_COVERAGE and self._vector:
                 sem_scores = self._vector.phrase_similarities(
-                    state.constraint_phrases, candidates)
+                    rank_phrases, candidates)
             candidates, cov_scores = self._coverage.rerank_scored(
-                candidates, state.constraint_phrases, prefer_cat=prefer_cat,
+                candidates, rank_phrases, prefer_cat=prefer_cat,
                 semantic_scores=sem_scores,
                 semantic_weight=self.SEMANTIC_COVERAGE_WEIGHT if sem_scores else 0.0,
                 semantic_gate=self.SEMANTIC_COVERAGE_GATE,
@@ -433,10 +515,16 @@ class Agent:
             if self._tracer.enabled:
                 self._tracer.note(
                     "coverage rerank on phrases: "
-                    + "; ".join(state.constraint_phrases[:6]))
+                    + "; ".join(rank_phrases[:6]))
 
         if self.USE_NEG_DOWNWEIGHT and self.USE_NEED_MODEL and candidates:
             candidates = apply_negatives(candidates, state.need, self._coverage.doc)
+
+        # Hard-constraint category gate: demote wrong-category lookalikes (e.g. boots after the
+        # shopper revised to sandals). Non-destructive; only when the need category is known.
+        if self.USE_CATEGORY_GATE and self.USE_NEED_MODEL and candidates:
+            candidates = apply_category_gate(
+                candidates, state.need.category, self._catalog.products)
 
         guidance = None
         if self.USE_ACTIVE_CONVERGENCE and self.USE_NEED_MODEL and candidates:
@@ -464,15 +552,27 @@ class Agent:
         near_tie = (self.RERANK_NEAR_TIE_MARGIN <= 0
                     or state.belief.margin < self.RERANK_NEAR_TIE_MARGIN)
 
+        ce_score_map: dict[str, float] = {}
         if self._cross_encoder is not None and candidates and near_tie:
             base = list(candidates)
             ce_scores = self._cross_encoder.scores(
                 state.query_text(), base, self.CE_DEPTH)
             if ce_scores:
-                head = base[:len(ce_scores)]
-                ce_order = sorted(range(len(head)), key=lambda i: -ce_scores[i])
-                candidates = rrf(base, [head[i] for i in ce_order],
-                                 self.CE_WEIGHT, top_n=len(base))
+                ce_score_map = {base[i]: ce_scores[i] for i in range(len(ce_scores))}
+                gated_convex = self.USE_CE_CONVEX and (
+                    self.CE_CONVEX_GATE_MARGIN <= 0
+                    or state.belief.margin < self.CE_CONVEX_GATE_MARGIN)
+                if gated_convex:
+                    # Score-aware fusion: blend normalized satisfaction (cov_scores) + CE magnitudes
+                    # over the CE head. Uses the CE's precision score, not just its rank order (RRF).
+                    # Gated to low-margin (contested/paraphrase) turns so confident verbatim turns
+                    # keep RRF and the leaky public signal is not diluted.
+                    candidates = convex_fuse(base, cov_scores, ce_scores, self.CE_BETA)
+                else:
+                    head = base[:len(ce_scores)]
+                    ce_order = sorted(range(len(head)), key=lambda i: -ce_scores[i])
+                    candidates = rrf(base, [head[i] for i in ce_order],
+                                     self.CE_WEIGHT, top_n=len(base))
 
         if self._llm_reranker is not None and candidates and near_tie:
             base = list(candidates)
@@ -480,6 +580,15 @@ class Agent:
                 state.all_text, candidates, top_k, self.LLM_RERANK_DEPTH)
             if llm_order != base:
                 candidates = rrf(base, llm_order, self.LLM_WEIGHT, top_n=len(base))
+
+        # Learned re-ranker: re-score the pool by the trained linear combination of all signals.
+        # Uses the ORIGINAL retrieval order (for the retrieval_rank feature) + satisfaction + CE
+        # scores as features, so it supersedes the ad-hoc CE/LLM fusion above when enabled.
+        if self._ltr is not None and len(candidates) > 1:
+            candidates, _ltr_scores = self._ltr.score_order(
+                retrieval_order, satisfaction_scores=cov_scores, ce_scores=ce_score_map,
+                phrases=state.constraint_phrases, budget=budget_val,
+                category=state.need.category)
 
         if self._tracer.enabled:
             self._tracer.stage(
@@ -608,6 +717,22 @@ class Agent:
         if self.REVEAL_REQUIRE_CONSTRAINTS and not new_constraints:
             return top_k
         return min(top_k, self.REVEAL_HOLDBACK_K)
+
+    def _nl_rank_phrases(self, state: ConversationState) -> list[str]:
+        """Ranking phrases derived from the structured NeedModel, for natural-language turns that
+        carry no simulator constraint marker. Each positive slot value (except budget, handled via
+        price proximity) becomes a phrase the satisfaction/coverage ranker matches lexically and
+        semantically — so 'ankle boots'→category=boot, 'block-heel sandals'→category=sandal reach the
+        ranker. Deduped, order-stable. Empty when the NeedModel found nothing (ranker then no-ops)."""
+        seen: set[str] = set()
+        out: list[str] = []
+        for c in state.need.positives():
+            value = (c.value or "").strip()
+            if not value or c.slot == "budget" or value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+        return out
 
     def _trace_top_picks(
         self, candidates: list[str], cov_scores: dict[str, float], n: int = 5

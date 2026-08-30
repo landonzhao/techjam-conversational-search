@@ -73,6 +73,43 @@ class RRFTest(unittest.TestCase):
         self.assertAlmostEqual(w, VECTOR_WEIGHT, places=5)
 
 
+class ConvexFuseTest(unittest.TestCase):
+    def test_ce_magnitude_reorders_head(self):
+        # primary (satisfaction) prefers A; CE strongly prefers C. At beta=1 (CE only) C leads.
+        from src.retrieval import convex_fuse
+        pool = ["A", "B", "C"]
+        sat = {"A": 1.0, "B": 0.5, "C": 0.0}
+        ce = [0.1, 0.2, 0.9]  # aligned to pool[:3]
+        self.assertEqual(convex_fuse(pool, sat, ce, beta=1.0)[0], "C")
+        # beta=0 (primary only) keeps A on top despite CE
+        self.assertEqual(convex_fuse(pool, sat, ce, beta=0.0)[0], "A")
+
+    def test_blend_middle(self):
+        # A: high sat/low ce; C: low sat/high ce. beta=0.5 → blended tie broken by head index → A.
+        from src.retrieval import convex_fuse
+        order = convex_fuse(["A", "B", "C"], {"A": 1.0, "B": 0.0, "C": 0.0}, [0.0, 0.0, 1.0], 0.5)
+        self.assertEqual(set(order), {"A", "B", "C"})  # permutation preserved
+        self.assertEqual(order[0], "A")
+
+    def test_empty_ce_preserves_order(self):
+        from src.retrieval import convex_fuse
+        self.assertEqual(convex_fuse(["A", "B"], {"A": 1.0}, [], 0.6), ["A", "B"])
+
+    def test_degenerate_scores_preserve_order(self):
+        # all-equal primary and secondary → neutral 0.5 → stable tie-break keeps incoming order
+        from src.retrieval import convex_fuse
+        self.assertEqual(
+            convex_fuse(["A", "B", "C"], {"A": 1.0, "B": 1.0, "C": 1.0}, [3.0, 3.0, 3.0], 0.6),
+            ["A", "B", "C"])
+
+    def test_tail_beyond_ce_head_preserved(self):
+        # CE only scored the first 2; the tail keeps incoming order and is appended after the head.
+        from src.retrieval import convex_fuse
+        order = convex_fuse(["A", "B", "C", "D"], {"A": 0.0, "B": 1.0}, [0.9, 0.1], beta=1.0)
+        self.assertEqual(order[0], "A")       # CE prefers A within the head
+        self.assertEqual(order[2:], ["C", "D"])  # tail untouched
+
+
 # ---------------------------------------------------------------------------
 # src/ranking.py
 class CoverageRerankerTest(unittest.TestCase):
@@ -164,6 +201,70 @@ class ExtractConstraintsTest(unittest.TestCase):
 
 # ---------------------------------------------------------------------------
 # src/understanding.py — category resolver
+class NeedModelReviseTest(unittest.TestCase):
+    def _c(self, slot, value, pol=1, turn=0):
+        from src.understanding import Constraint
+        return Constraint(slot=slot, value=value, polarity=pol, turn=turn)
+
+    def test_single_valued_category_overwrites(self):
+        # category is single-valued: 'sandal' (turn 3) supersedes 'boot' (turn 1)
+        from src.understanding import NeedModel
+        n = NeedModel()
+        n.revise([self._c("category", "boot", turn=1)])
+        n.revise([self._c("category", "sandal", turn=3)])
+        cats = [c.value for c in n.positives("category")]
+        self.assertEqual(cats, ["sandal"])
+        self.assertEqual(n.category, "sandal")
+
+    def test_multi_valued_color_coexists(self):
+        # color is multi-valued: 'black or navy' both survive
+        from src.understanding import NeedModel
+        n = NeedModel()
+        n.revise([self._c("color", "black", turn=1)])
+        n.revise([self._c("color", "navy", turn=1)])
+        self.assertEqual({c.value for c in n.positives("color")}, {"black", "navy"})
+
+    def test_single_valued_size_overwrites(self):
+        from src.understanding import NeedModel
+        n = NeedModel()
+        n.revise([self._c("size", "m", turn=1)])
+        n.revise([self._c("size", "l", turn=2)])
+        self.assertEqual([c.value for c in n.positives("size")], ["l"])
+
+    def test_negative_does_not_trigger_overwrite(self):
+        # a negative constraint on a single-valued slot must not wipe a positive value
+        from src.understanding import NeedModel
+        n = NeedModel()
+        n.revise([self._c("category", "boot", turn=1)])
+        n.revise([self._c("category", "sandal", pol=-1, turn=2)])
+        self.assertIn("boot", [c.value for c in n.positives("category")])
+
+
+class CategoryGateTest(unittest.TestCase):
+    def _cat(self):
+        return {
+            "SANDAL": {"title": "Leevar Square Toe Heeled Sandals for Women"},
+            "BOOT": {"title": "TOMS Women's Chelsea Boots"},
+            "AMBIG": {"title": "Comfortable footwear for everyday"},  # no category noun
+        }
+
+    def test_wrong_category_demoted(self):
+        from src.understanding import apply_category_gate
+        out = apply_category_gate(["BOOT", "SANDAL"], "sandal", self._cat())
+        self.assertEqual(out, ["SANDAL", "BOOT"])  # boot demoted below the sandal
+
+    def test_unknown_category_not_demoted(self):
+        # a candidate whose title resolves to no category is left in place (never demoted on a guess)
+        from src.understanding import apply_category_gate
+        out = apply_category_gate(["AMBIG", "BOOT"], "sandal", self._cat())
+        self.assertEqual(out[0], "AMBIG")
+
+    def test_no_need_category_is_noop(self):
+        from src.understanding import apply_category_gate
+        self.assertEqual(apply_category_gate(["BOOT", "SANDAL"], None, self._cat()),
+                         ["BOOT", "SANDAL"])
+
+
 class CategoryResolverTest(unittest.TestCase):
     def test_handbag_resolves_to_bag(self):
         from src.understanding import resolve_category
@@ -345,6 +446,35 @@ class SatisfactionScorerTest(unittest.TestCase):
             ["P", "Q", "T"], ["ribbed velvety fabric"])
         self.assertEqual(order, ["P", "Q", "T"])
         self.assertEqual(max(sat.values()), 0.0)
+
+
+class AdaptivePriorTest(unittest.TestCase):
+    """Merged teammate multi-channel prior + per-candidate semantic gate (branch-ranking)."""
+    def _scorer(self):
+        from src.ranking import CoverageReranker, NeedSatisfactionScorer
+        cat = {
+            "POP": {"title": "popular tee", "rating_number": 100000, "average_rating": 4.8},
+            "TAIL": {"title": "rare tee", "rating_number": 5, "average_rating": 4.9},
+        }
+        return NeedSatisfactionScorer(CoverageReranker(cat), vector=None, pop_weight=0.3)
+
+    def test_sem_gate_curve(self):
+        s = self._scorer()
+        self.assertAlmostEqual(s._sem_gate(0.0), 1.0)          # unreliable → full prior
+        self.assertAlmostEqual(s._sem_gate(0.9), 0.0)          # confident → silenced
+        self.assertTrue(0.0 < s._sem_gate(0.45) < 1.0)         # linear between
+
+    def test_prior_silenced_for_semantically_confident_candidate(self):
+        s = self._scorer()
+        pri = s._adaptive_prior(["POP", "TAIL"], {"POP": 0.0, "TAIL": 0.9}, n_phrases=1)
+        self.assertEqual(pri["TAIL"], 0.0)          # long-tail confident match protected
+        self.assertGreater(pri["POP"], 0.0)         # uncertain popular item gets the nudge
+
+    def test_pop_weight_override_zero_disables_prior(self):
+        # my NL-turn path passes pop_weight=0 → prior fully off (ties fall back to retrieval order)
+        s = self._scorer()
+        pri = s._adaptive_prior(["POP", "TAIL"], {"POP": 0.0, "TAIL": 0.0}, n_phrases=1, pop_weight=0.0)
+        self.assertEqual(set(pri.values()), {0.0})
 
 
 if __name__ == "__main__":

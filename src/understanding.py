@@ -13,8 +13,11 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from src.catalog import TOKEN_RE
-from src.config import CONVERGE_HIGH, CONVERGE_MID
+from src.catalog import TOKEN_RE, text
+from src.config import (
+    BELIEF_ENTROPY_WEIGHT, BELIEF_MARGIN_WEIGHT, BELIEF_STABILITY_WEIGHT,
+    COMPARISON_MARGIN, CONVERGE_HIGH, CONVERGE_MID, SINGLE_VALUED_SLOTS,
+)
 
 MATERIAL_RE = re.compile(
     r"\b(cotton|polyester|nylon|leather|wool|spandex|silk|rayon|fabric|denim|linen|"
@@ -141,11 +144,19 @@ class NeedModel:
     category: str | None = None
 
     def revise(self, new: list[Constraint]) -> None:
-        """Non-monotonic merge: a new constraint on the same (slot, value) supersedes the
-        old one (newer turn wins), so 'actually, not down' flips a prior 'down'. Different
-        values on the same slot coexist (multi-value slots)."""
+        """Non-monotonic merge (DST selective-overwrite).
+
+        A new constraint on the same (slot, value) supersedes the old one (newer turn wins), so
+        'actually, not down' flips a prior 'down'. For SINGLE_VALUED_SLOTS (category/size/budget) a
+        new POSITIVE value also supersedes older positive values of that slot — so 'ankle boots' then
+        'actually, block-heel sandals' leaves category=sandal, not both. Multi-valued slots
+        (color/material/feature/style/use_case) still coexist, so 'black or navy' is preserved."""
         for c in new:
             self.constraints = [x for x in self.constraints if x.key() != c.key()]
+            if c.polarity > 0 and c.slot in SINGLE_VALUED_SLOTS:
+                self.constraints = [
+                    x for x in self.constraints
+                    if not (x.slot == c.slot and x.polarity > 0)]
             self.constraints.append(c)
             if c.slot == "category" and c.polarity > 0:
                 self.category = c.value
@@ -527,7 +538,9 @@ class BeliefModel:
                 attr_unc[slot] = 1.0
 
         need_conf = 1.0 - (sum(attr_unc.values()) / len(attr_unc) if attr_unc else 0.0)
-        item_conf = 0.5 * margin + 0.3 * (1.0 - ent) + 0.2 * min(stable / 2.0, 1.0)
+        item_conf = (BELIEF_MARGIN_WEIGHT * margin
+                     + BELIEF_ENTROPY_WEIGHT * (1.0 - ent)
+                     + BELIEF_STABILITY_WEIGHT * min(stable / 2.0, 1.0))
         conf = min(item_conf, need_conf)
         return Belief(top, margin, ent, stable, cat, item_conf, need_conf, conf, attr_unc)
 
@@ -580,7 +593,7 @@ class QuestionSelector:
                 return attr, self._confirm_phrase(attr, belief.top_asin)
         # When top candidates are nearly tied, a product comparison question is more
         # discriminating than asking about an abstract attribute.
-        if belief.margin < 0.15 and len(head) >= 2:
+        if belief.margin < COMPARISON_MARGIN and len(head) >= 2:
             cmp = self._comparison_phrase(head)
             if cmp:
                 return "other", cmp
@@ -748,3 +761,26 @@ def apply_negatives(candidates: list[str], need: NeedModel, doc_fn) -> list[str]
         text = doc_fn(asin)
         (drop if any(v in text for v in negs) else keep).append(asin)
     return keep + drop
+
+
+def apply_category_gate(
+    candidates: list[str], need_category: str | None, catalog: dict[str, dict]
+) -> list[str]:
+    """Hard-constraint (category) gate: demote candidates whose OWN title resolves to a different
+    canonical category than the confidently-known need category. Stable, non-destructive (violators
+    go to the back, never dropped — so a mis-resolution can't lose the target from the pool).
+
+    Rationale (research: hard constraints applied before ranking, confidence-gated — GenFacet /
+    relevance filtering): a semantically similar but categorically wrong lookalike (a boot when the
+    shopper revised to a sandal) should not outrank the right category. Confidence gate = we only act
+    when BOTH the need category and the candidate's own title category resolve to known buckets AND
+    they differ; unknown/ambiguous candidate categories are left in place (never demoted on a guess).
+    """
+    if not need_category or not candidates:
+        return candidates
+    keep, demote = [], []
+    for asin in candidates:
+        title = text(catalog.get(asin, {}).get("title")).lower()
+        cand_cat = resolve_category(title)
+        (demote if (cand_cat and cand_cat != need_category) else keep).append(asin)
+    return keep + demote

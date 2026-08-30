@@ -43,6 +43,48 @@ def rrf(
 
 
 # ---------------------------------------------------------------------------
+# Calibrated convex-combination fusion (roadmap component I — score-aware rerank fusion)
+
+def _minmax(vals: list[float]) -> list[float]:
+    """Min-max normalize to [0,1]; degenerate (all equal) → neutral 0.5 (preserves tie-break)."""
+    if not vals:
+        return []
+    lo, hi = min(vals), max(vals)
+    if hi - lo <= 1e-12:
+        return [0.5] * len(vals)
+    return [(v - lo) / (hi - lo) for v in vals]
+
+
+def convex_fuse(
+    pool: list[str],
+    primary_scores: dict[str, float],
+    secondary_scores: list[float],
+    beta: float,
+) -> list[str]:
+    """Score-aware fusion of two rankers over the head `secondary_scores` covers.
+
+    Unlike RRF (which uses only rank order), this blends the calibrated magnitudes:
+        FinalScore(c) = (1 − beta)·minmax(primary)[c] + beta·minmax(secondary)[c]
+    computed over the first ``len(secondary_scores)`` candidates (the head the secondary ranker —
+    e.g. the cross-encoder — actually scored). The tail beyond that head is kept in the incoming
+    (primary) order. Deterministic: ties broken by incoming head index. beta=0 ≈ primary-only,
+    beta=1 ≈ secondary-only. Degenerate/empty secondary → incoming order unchanged.
+
+    `primary_scores` is an ASIN→score map (e.g. satisfaction/coverage); `secondary_scores` is a
+    positional list aligned to pool[:len]. Returns a full permutation of `pool`.
+    """
+    if not secondary_scores:
+        return list(pool)
+    d = len(secondary_scores)
+    head = pool[:d]
+    p_norm = _minmax([float(primary_scores.get(a, 0.0)) for a in head])
+    s_norm = _minmax(list(secondary_scores))
+    blended = [(1.0 - beta) * p_norm[i] + beta * s_norm[i] for i in range(d)]
+    order = sorted(range(d), key=lambda i: (-blended[i], i))
+    return [head[i] for i in order] + list(pool[d:])
+
+
+# ---------------------------------------------------------------------------
 # Dense retrieval
 
 class VectorRetriever:

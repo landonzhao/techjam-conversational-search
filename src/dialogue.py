@@ -7,6 +7,9 @@ from dataclasses import dataclass, field
 
 from src.config import (
     ASK_PRIORITY, CONFIDENCE_EMA, DELIVER_TURN_THRESHOLD, EXPLORE_TERM_THRESHOLD,
+    INTENT_BROWSING_CUE_WEIGHT, INTENT_BROWSING_CUTOFF, INTENT_BUYING_CUE_WEIGHT,
+    INTENT_BUYING_CUTOFF, INTENT_HARD_CONSTRAINT_WEIGHT, INTENT_SPECIFICITY_PIVOT,
+    INTENT_SPECIFICITY_SLOPE,
 )
 from src.understanding import Belief, NeedModel
 
@@ -55,19 +58,20 @@ class IntentRouter:
         low = message.lower()
         s = 0.0
         if any(t in low for t in self.BUYING):
-            s += 1.5
+            s += INTENT_BUYING_CUE_WEIGHT
         if any(t in low for t in self.BROWSING):
-            s -= 1.5
+            s -= INTENT_BROWSING_CUE_WEIGHT
         if _HARD_CONSTRAINT_RE.search(low):
-            s += 1.0
-        s += 0.18 * (distinct_terms - 6)  # specificity: few terms→browsing, many→buying
+            s += INTENT_HARD_CONSTRAINT_WEIGHT
+        # specificity: few distinct terms → browsing, many → buying
+        s += INTENT_SPECIFICITY_SLOPE * (distinct_terms - INTENT_SPECIFICITY_PIVOT)
         return 1.0 / (1.0 + math.exp(-s))
 
     @staticmethod
     def label(buying_score: float) -> str:
-        if buying_score >= 0.6:
+        if buying_score >= INTENT_BUYING_CUTOFF:
             return "buying"
-        if buying_score <= 0.4:
+        if buying_score <= INTENT_BROWSING_CUTOFF:
             return "browsing"
         return "mixed"
 

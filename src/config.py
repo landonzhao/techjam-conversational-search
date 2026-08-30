@@ -43,6 +43,24 @@ EXPANSION_WEIGHT: float = 0.1  # weight of the expansion BM25 side-track in RRF
 # ---------------------------------------------------------------------------
 # Intent routing / EMA
 CONFIDENCE_EMA: float = 0.6  # buying_score EMA: b_t = α·raw + (1−α)·b_{t−1}
+# IntentRouter.score coefficients (were hardcoded in src/dialogue.py; heuristic — see DECISIONS.md).
+# s = BUYING_CUE·[buy phrase] − BROWSING_CUE·[browse phrase] + HARD_CONSTRAINT·[regex hit]
+#     + SPECIFICITY_SLOPE·(distinct_terms − SPECIFICITY_PIVOT);  buying_score = sigmoid(s)
+INTENT_BUYING_CUE_WEIGHT: float = 1.5
+INTENT_BROWSING_CUE_WEIGHT: float = 1.5
+INTENT_HARD_CONSTRAINT_WEIGHT: float = 1.0
+INTENT_SPECIFICITY_SLOPE: float = 0.18
+INTENT_SPECIFICITY_PIVOT: int = 6
+INTENT_BUYING_CUTOFF: float = 0.6    # buying_score ≥ this → "buying"
+INTENT_BROWSING_CUTOFF: float = 0.4  # buying_score ≤ this → "browsing"; between → "mixed"
+# BeliefModel item-confidence blend (were hardcoded in src/understanding.py):
+# item_conf = MARGIN·margin + ENTROPY·(1−entropy) + STABILITY·min(stable/2, 1)
+BELIEF_MARGIN_WEIGHT: float = 0.5
+BELIEF_ENTROPY_WEIGHT: float = 0.3
+BELIEF_STABILITY_WEIGHT: float = 0.2
+# QuestionSelector: ask a direct product-comparison question when the top-2 belief margin is below
+# this (candidates nearly tied → comparing beats an abstract attribute question).
+COMPARISON_MARGIN: float = 0.15
 
 # Convergence thresholds for belief-driven dialogue state
 CONVERGE_HIGH: float = 0.60  # confidence ≥ this → DELIVER
@@ -95,6 +113,13 @@ PRICE_NEAR: float = 0.02              # |price-budget|/budget below this = exact
 PRICE_LOOSE: float = 0.15             # below this = near match; beyond = mild evidence against
 PRICE_FAR_PENALTY: float = 0.1        # penalty slope for a present-but-far price (capped)
 
+# Hard-constraint category gate (roadmap #2). Demote candidates whose own title resolves to a
+# DIFFERENT canonical category than the confidently-known need category (e.g. keep sandals ahead of
+# boots after 'ankle boots'→'block-heel sandals'). Non-destructive (violators to the back, never
+# dropped). OFF by default: on the leaky public set category words already leak, so a hard gate risks
+# the guardrail; needs shadow-suite validation. Research: confidence-gated hard filtering (GenFacet).
+USE_CATEGORY_GATE: bool = False
+
 # Initiative A — structured constraint coverage. A second ranking track that scores candidates
 # by how many NORMALIZED NeedModel constraints (material=leather, size=2T, polarity-aware) they
 # satisfy, matched against catalog text — not verbatim message phrases. Fused with the verbatim
@@ -116,13 +141,43 @@ USE_SATISFACTION_RANKER: bool = True
 # Weight on the semantic-cosine term relative to the verbatim-lexical term. 1.0 = a paraphrase match
 # (cosine ~0.5) competes with a partial verbatim match; 0 = pure lexical (reproduces coverage).
 SATISFACTION_SEM_ALPHA: float = 1.0
-# Adaptive popularity (Phase 2). eval_matrix showed popularity is the dominant villain on the honest
-# set (pure coverage leak-free 0.125 -> 0.767 with popularity removed) but HELPS the leaky public set.
-# So blend popularity as a prior weighted w_pop = SATISFACTION_POP_WEIGHT * (1 - specificity), where
-# specificity rises with how much discriminating signal the shopper disclosed: fame breaks ties when
-# the turn is vague, and fades to ~0 once the need is specific (so the long-tail target is not buried).
-SATISFACTION_POP_WEIGHT: float = 0.15   # validated sweet spot (holds public, lifts honest sets)
+# Adaptive multi-channel prior (Phase 2, revised — teammate branch-ranking, Walmart Unified
+# Supervision Framework style). A flat log-popularity nudge is the dominant villain on the honest set
+# (pure coverage leak-free 0.125 -> 0.767 with popularity removed) yet HELPS the leaky public set: the
+# prior is only wrong when the semantic channel is already confident about a long-tail match. So the
+# prior is graded (two channels) and decayed by TWO factors — user specificity AND per-candidate
+# semantic confidence:
+#   w_pop(a) = SATISFACTION_POP_WEIGHT · (1 − specificity) · sem_gate(sem_conf(a))
+#   prior(a) = POP_CHANNEL · pool_norm(log1p(rating_number)) + QUALITY_CHANNEL · norm(avg_rating)
+#   ranked(a) = satisfaction(a) + w_pop(a) · prior(a)
+# See NeedSatisfactionScorer._adaptive_prior. On natural-language turns the Agent passes pop_weight=0
+# so the generic regex-derived phrases don't let fame reorder a well-retrieved target (see agent.py).
+# VALUE: 0.15 (reverted from the teammate's 0.3). Consolidation measurement (docs/EXPERIMENTS.md
+# CONSOLIDATION-03): her 0.3/REF=6 defaults regressed OUR full pipeline (public 0.8629 < 0.88 floor);
+# the MECHANISM (multi-channel + semantic gate) with the proven 0.15/REF=3 values is strictly better
+# on both axes (public 0.8842 ✓, pillar_free 0.6549 vs 0.6388). Her subset +0.036 didn't transfer.
+SATISFACTION_POP_WEIGHT: float = 0.15
+# Weights of the two prior channels — normalised to sum 1 so the prior stays on [0,1] (sat's scale).
+SATISFACTION_POP_CHANNEL: float = 0.7      # log(rating_number), pool-normalised
+SATISFACTION_QUALITY_CHANNEL: float = 0.3  # (average_rating − 3)/2, clipped to [0,1]
+# Per-candidate semantic gate. Cosine ≤ LOW → full popularity (semantic unreliable, lean on prior);
+# ≥ HIGH → zero popularity (trust the long-tail semantic match, don't let a popular near-neighbour
+# overwrite it); linear between. Tuned on branch-ranking.
+SATISFACTION_SEM_GATE_LOW: float = 0.25
+SATISFACTION_SEM_GATE_HIGH: float = 0.65
+
+# Learning-to-Rank (docs/ADVANCED_RANKING_PLAN.md). A trained linear model (cache/ltr_model.json,
+# built by scripts/collect_ltr_data.py + train_ltr.py on leak-balanced data) re-ranks the pool by the
+# learned combination of all signals (retrieval rank, satisfaction, coverage, cross-encoder, price,
+# popularity...). OFF by default: the mechanism is validated (it learns to down-weight the verbatim
+# leak) but not yet shown to beat the satisfaction+cross-encoder default through the evaluator.
+USE_LTR: bool = False
+LTR_MODEL_PATH: str = "cache/ltr_model.json"
 # Number of disclosed constraint phrases at which specificity saturates to 1 (popularity -> 0).
+# Kept at 3 (teammate branch-ranking raised it to 6 on a 25-row subset, +0.036; but on OUR full
+# pipeline REF=6 with pop_weight=0.3 dropped public to 0.8629 < floor — see CONSOLIDATION-03). With
+# the per-candidate semantic gate now doing the honest-set protection, REF=3 holds the public floor
+# (0.8842) and keeps pillar_free high (0.6549). Re-sweep on the full sets, not subsets, if revisiting.
 SATISFACTION_SPECIFICITY_REF: int = 3
 
 # Fix 1 — bounded demotion. RRF weight of the retrieval (dense+BM25) order fused with the verbatim
@@ -165,6 +220,25 @@ COVERAGE_POP_CAP: float = 0.0
 # Optional rerankers (off by default — measured neutral/negative)
 CE_DEPTH: int = 50    # candidates the cross-encoder rescores
 CE_WEIGHT: float = 1.0
+# Cross-encoder fusion mode (roadmap component I — docs/EXPERIMENTS.md, exp CE-FUSION-01).
+# RRF fusion (CE_WEIGHT above) uses only the CE RANK order and discards its score magnitudes.
+# Convex mode blends the min-max-normalized satisfaction and CE scores over the CE head:
+#   FinalScore(c) = (1 − CE_BETA)·SatNorm(c) + CE_BETA·CENorm(c)
+# STATUS: PROMISING — ITERATE (OFF by default). Validated on the ranking-isolation harness
+# (scripts/exp_ce_fusion.py): vs RRF, β=0.6 lifts leak-free MRR 0.633→0.693 (+0.060) and pillar_free
+# MRR 0.452→0.548 (+0.096), 53–74 sessions improved vs 11–16 worsened. BUT the official public
+# evaluator REGRESSES at every honest-winning β (β=0.6: TechScore −0.0068, β=0.5: −0.010), because
+# the MS-MARCO cross-encoder's magnitude dilutes the leaky verbatim signal. No global β satisfies
+# both honest (+≥0.01 MRR) and public (≤0.005 regression). Kept OFF pending a GATED convex (apply the
+# blend only on uninformative/paraphrase turns — the next experiment). Set True to enable globally.
+USE_CE_CONVEX: bool = False
+CE_BETA: float = 0.6
+# Gated convex (the CE-FUSION-01 follow-up): apply convex fusion ONLY when the satisfaction belief
+# margin is below this (a contested/paraphrase turn where the CE precision helps); on confident
+# verbatim turns (high margin) keep rank-only RRF so the leaky public signal is not diluted. 0 =
+# ungated (convex on every turn, which regressed public). belief.margin ∈ [0,1]. Needs shadow-suite
+# validation before its default is chosen; wired for measurement.
+CE_CONVEX_GATE_MARGIN: float = 0.5
 LLM_RERANK_DEPTH: int = 20
 LLM_WEIGHT: float = 0.3
 LLM_MODEL: str = "gemini-flash-lite-latest"
@@ -200,6 +274,22 @@ REVEAL_HOLDBACK_K: int = 1           # list length while holding back (measured:
 # split on, asked as a feature question. Category-adaptive by construction; off by default until
 # measured on pillar_free browsing + the public MTTC guardrail.
 USE_ADAPTIVE_CLARIFY: bool = False
+
+# ---------------------------------------------------------------------------
+# Natural-language constraint capture (docs/EXPERIMENTS.md — keystone honest-generalization fix).
+# `extract_constraints` only fires on the simulator's "key requirement is:" marker, so on natural
+# shopper language `constraint_phrases` is empty and the satisfaction/coverage ranker no-ops (falls
+# back to raw retrieval order — our primary ranking signal is coupled to the benchmark's disclosure
+# syntax). When on, the ranker ALSO consumes the NeedModel's structured positive slot values as
+# ranking phrases — but ONLY on turns where no marker phrase was disclosed, so evaluator/paraphrase
+# sets (which always carry the marker) are unchanged. Research: query-understanding → structured
+# constraints → constrained ranking (GenFacet; relevance filtering).
+USE_NL_CONSTRAINTS: bool = True
+# Slots that hold at most one active value; a newer positive supersedes older positives of the SAME
+# slot (DST selective-overwrite — SOM-DST / mentioned-slot-pools). Multi-valued slots (color,
+# material, feature, style, use_case) accumulate so "black or navy" / "cotton or linen" coexist.
+# Fixes stale-constraint revision (e.g. "ankle boots" → "actually, block-heel sandals").
+SINGLE_VALUED_SLOTS: tuple[str, ...] = ("category", "size", "budget")
 
 # ---------------------------------------------------------------------------
 # DCP (context engine)
