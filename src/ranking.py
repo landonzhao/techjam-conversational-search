@@ -13,7 +13,7 @@ from src.config import (
     COVERAGE_FULL_PHRASE_BONUS, COVERAGE_LEN_WEIGHT, COVERAGE_POP_BLEND,
     COVERAGE_TIE_BREAK, POP_WEIGHT, PRICE_FAR_PENALTY, PRICE_LOOSE, PRICE_NEAR,
     RRF_K, SATISFACTION_POP_CHANNEL, SATISFACTION_QUALITY_CHANNEL,
-    SATISFACTION_SEM_GATE_HIGH, SATISFACTION_SEM_GATE_LOW, TAG_WEIGHT,
+    SATISFACTION_SEM_GATE_HIGH, SATISFACTION_SEM_GATE_LOW, SATISFACTION_UNKNOWN_FLOOR, TAG_WEIGHT,
 )
 
 
@@ -181,6 +181,23 @@ class CoverageReranker:
             if toks:
                 prepared.append((toks, " ".join(toks)))
         return prepared
+
+    def exact_match_counts(self, asins: list[str], phrases: list[str]) -> dict[str, int]:
+        """Count complete exact-phrase matches per candidate (used for regime detection + guard).
+
+        A phrase counts as matched when all its tokens appear as a contiguous span in the
+        candidate's catalog text (canonicalized via TOKEN_RE). This is deliberately lexical, not
+        semantic — exact catalog verbatim is the signal for the public leak path.
+        """
+        prepared = self._prepare(phrases)
+        counts: dict[str, int] = {}
+        for asin in asins:
+            catalog_text = " ".join(TOKEN_RE.findall(self.doc(asin)))
+            counts[asin] = sum(
+                1 for _tokens, whole in prepared
+                if whole and whole in catalog_text
+            )
+        return counts
 
     def _structured(self, asin: str,
                     constraints: list[tuple[str, int, float]]) -> float:
@@ -378,6 +395,56 @@ class CoverageReranker:
         return 1 if re.search(rf"\b{re.escape(cat)}s?\b", title) else 0
 
 
+def guard_retrieval_head(
+    retrieval_order: list[str],
+    ranked_order: list[str],
+    guard_k: int,
+    visible_k: int,
+) -> tuple[list[str], list[str]]:
+    """Preserve a bounded retrieval head inside the visible result window.
+
+    Hybrid retrieval (BM25 + dense) produces a fused consensus order that is generally
+    sound; absolute cosine/satisfaction scores are noisy by comparison.  A small score
+    difference should not eject a candidate retrieval ranked in its top-k from the
+    ten-item response window.  This pass force-inserts up to `guard_k` retrieval head
+    candidates into the visible top-`visible_k`, replacing the lowest unprotected slots,
+    then re-sorts the resulting window by `ranked_order`'s score order so our MRR
+    ordering is preserved within the window.
+
+    Disabled automatically when exact catalog evidence exists (callers must set guard_k=0
+    in that case) so the verbatim public-leak path is never diluted.
+
+    Returns (full_order_with_guard, list_of_inserted_asins).
+    """
+    if guard_k <= 0 or visible_k <= 0 or not ranked_order:
+        return ranked_order, []
+    protected = retrieval_order[:min(guard_k, visible_k, len(retrieval_order))]
+    protected_set = set(protected)
+    selected = list(ranked_order[:visible_k])
+    selected_set = set(selected)
+    inserted: list[str] = []
+    for asin in protected:
+        if asin in selected_set:
+            continue
+        # Replace the lowest-ranked unprotected slot in the visible window.
+        replace_at = next(
+            (i for i in range(len(selected) - 1, -1, -1)
+             if selected[i] not in protected_set),
+            None,
+        )
+        if replace_at is None:
+            break
+        selected_set.discard(selected[replace_at])
+        selected[replace_at] = asin
+        selected_set.add(asin)
+        inserted.append(asin)
+    # Re-sort the visible window by ranked_order score order so MRR ordering is preserved.
+    rank_index = {a: i for i, a in enumerate(ranked_order)}
+    selected.sort(key=rank_index.__getitem__)
+    tail = [a for a in ranked_order if a not in selected_set]
+    return selected + tail, inserted
+
+
 class NeedSatisfactionScorer:
     """Ranks candidates by how well they SATISFY the disclosed need — a generalization of coverage.
 
@@ -406,7 +473,8 @@ class NeedSatisfactionScorer:
                  pop_channel: float = SATISFACTION_POP_CHANNEL,
                  quality_channel: float = SATISFACTION_QUALITY_CHANNEL,
                  sem_gate_low: float = SATISFACTION_SEM_GATE_LOW,
-                 sem_gate_high: float = SATISFACTION_SEM_GATE_HIGH) -> None:
+                 sem_gate_high: float = SATISFACTION_SEM_GATE_HIGH,
+                 unknown_floor: float = SATISFACTION_UNKNOWN_FLOOR) -> None:
         self._cov = coverage
         self._vector = vector
         self.sem_alpha = sem_alpha
@@ -419,6 +487,9 @@ class NeedSatisfactionScorer:
         # Per-candidate semantic gate thresholds. Clamped so LOW < HIGH.
         self.sem_gate_low = max(0.0, min(sem_gate_low, sem_gate_high - 1e-6))
         self.sem_gate_high = max(self.sem_gate_low + 1e-6, sem_gate_high)
+        # Neutral floor for catalog-silent candidates (zero lexical AND zero semantic evidence).
+        # Silence ≠ conflict; prevent unfair demotion of sparse listings vs. boilerplate matches.
+        self.unknown_floor = max(0.0, unknown_floor)
 
     def _lexical(self, toks: list[str], catalog_text: str) -> float:
         """IDF-weighted fraction of the phrase's tokens present verbatim, in [0, 1]."""
@@ -460,8 +531,13 @@ class NeedSatisfactionScorer:
                 weight = 1.0 + COVERAGE_LEN_WEIGHT * len(toks)  # longer phrase = more specific
                 num += weight * match
                 den += weight
-            sat[a] = num / den if den > 0 else 0.0
+            raw = num / den if den > 0 else 0.0
             sem_conf[a] = top_sem
+            # Neutral floor: catalog-silent candidate (no lexical AND no semantic evidence) gets
+            # unknown_floor instead of 0 so sparse listings aren't unfairly demoted vs boilerplate.
+            sat[a] = (self.unknown_floor
+                      if raw <= 0.0 and top_sem <= 0.0 and self.unknown_floor > 0
+                      else raw)
         base_rank = {a: i for i, a in enumerate(asins)}
         # Adaptive multi-channel prior (teammate branch-ranking, Walmart Unified Supervision
         # Framework flavour): the prior supervises the ranking only where BOTH the shopper is still

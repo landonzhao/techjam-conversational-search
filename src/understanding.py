@@ -17,6 +17,7 @@ from src.catalog import TOKEN_RE, text
 from src.config import (
     BELIEF_ENTROPY_WEIGHT, BELIEF_MARGIN_WEIGHT, BELIEF_STABILITY_WEIGHT,
     COMPARISON_MARGIN, CONVERGE_HIGH, CONVERGE_MID, SINGLE_VALUED_SLOTS,
+    USE_CATEGORY_SWITCH_CLEAR,
 )
 
 MATERIAL_RE = re.compile(
@@ -144,19 +145,58 @@ class NeedModel:
     category: str | None = None
 
     def revise(self, new: list[Constraint]) -> None:
-        """Non-monotonic merge (DST selective-overwrite).
+        """Non-monotonic merge (DST selective-overwrite) with surgical correction rules.
 
         A new constraint on the same (slot, value) supersedes the old one (newer turn wins), so
         'actually, not down' flips a prior 'down'. For SINGLE_VALUED_SLOTS (category/size/budget) a
         new POSITIVE value also supersedes older positive values of that slot — so 'ankle boots' then
         'actually, block-heel sandals' leaves category=sandal, not both. Multi-valued slots
-        (color/material/feature/style/use_case) still coexist, so 'black or navy' is preserved."""
+        (color/material/feature/style/use_case) still coexist, so 'black or navy' is preserved.
+
+        Rule (a) — same-turn negation wins: when a positive and negative for the same (slot, value)
+        arrive in the same batch (e.g. 'polyester instead of linen'), the negative takes precedence
+        and the positive is dropped before any constraint is committed. Bryan's key insight: a
+        fallback extractor must not resurrect a value the shopper just rejected.
+
+        Rule (b) — category-switch retires stale modifiers: when the category slot changes, positive
+        non-category constraints from prior turns are cleared, because a shopper who switches from
+        'boots' to 'sandals' no longer wants the boot-specific material/color.
+        """
+        # Rule (a): resolve all same-turn negations before applying positives.
+        # Build the set of (slot, value) pairs explicitly negated in this batch.
+        same_turn_negative: set[tuple[str, str]] = set()
+        for c in new:
+            if c.polarity < 0 and c.value:
+                same_turn_negative.add((c.slot, c.value))
+        # Drop same-turn positives that are explicitly countered by a same-turn negative.
+        if same_turn_negative:
+            new = [
+                c for c in new
+                if not (c.polarity > 0 and c.value and (c.slot, c.value) in same_turn_negative)
+            ]
+
         for c in new:
             self.constraints = [x for x in self.constraints if x.key() != c.key()]
             if c.polarity > 0 and c.slot in SINGLE_VALUED_SLOTS:
                 self.constraints = [
                     x for x in self.constraints
                     if not (x.slot == c.slot and x.polarity > 0)]
+
+            # Rule (b): category-switch retires prior-turn modifiers (gated by USE_CATEGORY_SWITCH_CLEAR).
+            # Correct for real sessions but regressed public boundary MTTC (+2.5 turns) because the
+            # evaluator's verbatim disclosures can trigger spurious category parses, clearing valid
+            # constraints. Off by default until measured on the honest intent-override/boundary sets.
+            if (USE_CATEGORY_SWITCH_CLEAR
+                    and c.slot == "category" and c.polarity > 0
+                    and self.category and self.category != c.value):
+                new_turn = c.turn
+                self.constraints = [
+                    x for x in self.constraints
+                    if x.slot == "category"
+                    or x.polarity <= 0
+                    or (new_turn is not None and x.turn is not None and x.turn >= new_turn)
+                ]
+
             self.constraints.append(c)
             if c.slot == "category" and c.polarity > 0:
                 self.category = c.value

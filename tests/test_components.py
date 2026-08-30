@@ -239,6 +239,60 @@ class NeedModelReviseTest(unittest.TestCase):
         n.revise([self._c("category", "sandal", pol=-1, turn=2)])
         self.assertIn("boot", [c.value for c in n.positives("category")])
 
+    # Rule (a): same-turn negation wins
+    def test_same_turn_negation_drops_positive(self):
+        # "polyester instead of linen": negation and positive arrive in same batch → linen dropped
+        from src.understanding import NeedModel
+        n = NeedModel()
+        n.revise([
+            self._c("material", "linen", pol=1, turn=2),
+            self._c("material", "linen", pol=-1, turn=2),
+        ])
+        self.assertEqual([c.value for c in n.positives("material")], [])
+        self.assertEqual(len(n.negatives("material")), 1)
+
+    def test_same_turn_negation_other_positive_survives(self):
+        # "polyester instead of linen" — polyester positive must survive
+        from src.understanding import NeedModel
+        n = NeedModel()
+        n.revise([
+            self._c("material", "linen", pol=1, turn=2),
+            self._c("material", "linen", pol=-1, turn=2),
+            self._c("material", "polyester", pol=1, turn=2),
+        ])
+        self.assertIn("polyester", [c.value for c in n.positives("material")])
+        self.assertNotIn("linen", [c.value for c in n.positives("material")])
+
+    # Rule (b): category-switch retires stale prior-turn modifiers (only when flag is on)
+    def test_category_switch_clears_prior_modifiers(self):
+        import src.config as _cfg
+        if not _cfg.USE_CATEGORY_SWITCH_CLEAR:
+            self.skipTest("USE_CATEGORY_SWITCH_CLEAR is off — rule (b) not active")
+        from src.understanding import NeedModel
+        n = NeedModel()
+        n.revise([self._c("category", "boot", turn=1)])
+        n.revise([self._c("color", "brown", turn=1)])
+        n.revise([self._c("category", "sandal", turn=3)])
+        colors = [c.value for c in n.positives("color")]
+        self.assertEqual(colors, [], f"stale color 'brown' should be cleared on category switch, got {colors}")
+        self.assertEqual(n.category, "sandal")
+
+    def test_category_switch_preserves_current_turn_modifiers(self):
+        import src.config as _cfg
+        if not _cfg.USE_CATEGORY_SWITCH_CLEAR:
+            self.skipTest("USE_CATEGORY_SWITCH_CLEAR is off — rule (b) not active")
+        from src.understanding import NeedModel
+        n = NeedModel()
+        n.revise([self._c("category", "boot", turn=1)])
+        n.revise([self._c("color", "brown", turn=1)])
+        n.revise([
+            self._c("category", "sandal", turn=3),
+            self._c("color", "black", turn=3),
+        ])
+        colors = [c.value for c in n.positives("color")]
+        self.assertIn("black", colors)
+        self.assertNotIn("brown", colors)
+
 
 class CategoryGateTest(unittest.TestCase):
     def _cat(self):
@@ -437,15 +491,101 @@ class SatisfactionScorerTest(unittest.TestCase):
         self.assertGreater(sat["T"], sat["P"])
 
     def test_sem_alpha_zero_ignores_semantic(self):
-        # sem_alpha=0 disables the semantic term -> a stub vector cannot change the order; with no
-        # lexical overlap all scores are 0 and the input order is preserved (== coverage behaviour).
+        # sem_alpha=0 disables the semantic term -> a stub vector cannot change the order.
+        # With no lexical overlap, all candidates are catalog-silent and receive unknown_floor.
+        # Input order is preserved (tied scores fall back to retrieval rank).
         class StubVector:
             def phrase_similarity_matrix(self, phrases, asins):
                 return {a: [0.9] for a in asins}
-        order, sat = self._make(vector=StubVector(), sem_alpha=0.0).rank(
-            ["P", "Q", "T"], ["ribbed velvety fabric"])
+        from src.ranking import CoverageReranker, NeedSatisfactionScorer
+        cat = {
+            "T": {"title": "corduroy jacket", "features": "napped pile warm"},
+            "P": {"title": "plain cotton tee", "features": "basic"},
+            "Q": {"title": "leather belt", "features": "buckle"},
+        }
+        scorer = NeedSatisfactionScorer(CoverageReranker(cat), vector=StubVector(),
+                                        sem_alpha=0.0, unknown_floor=0.0)
+        order, sat = scorer.rank(["P", "Q", "T"], ["ribbed velvety fabric"])
         self.assertEqual(order, ["P", "Q", "T"])
         self.assertEqual(max(sat.values()), 0.0)
+
+    def test_unknown_floor_applied_to_silent_candidates(self):
+        # With no matching phrases, every candidate is catalog-silent.
+        # unknown_floor=0.5 should give each candidate score 0.5, not 0.
+        from src.ranking import CoverageReranker, NeedSatisfactionScorer
+        cat = {
+            "A": {"title": "blue jacket", "features": "warm"},
+            "B": {"title": "red hat", "features": "casual"},
+        }
+        scorer = NeedSatisfactionScorer(CoverageReranker(cat), unknown_floor=0.5)
+        order, sat = scorer.rank(["A", "B"], ["completely unrelated xyz phrase"])
+        self.assertAlmostEqual(sat["A"], 0.5)
+        self.assertAlmostEqual(sat["B"], 0.5)
+        # Input order preserved when scores are tied.
+        self.assertEqual(order, ["A", "B"])
+
+    def test_unknown_floor_not_applied_when_evidence_exists(self):
+        # A candidate WITH a lexical match must NOT be floored to 0.5.
+        from src.ranking import CoverageReranker, NeedSatisfactionScorer
+        cat = {
+            "A": {"title": "blue jacket", "features": "warm"},
+            "B": {"title": "completely different", "features": "other stuff"},
+        }
+        scorer = NeedSatisfactionScorer(CoverageReranker(cat), unknown_floor=0.5)
+        _order, sat = scorer.rank(["A", "B"], ["blue jacket"])
+        self.assertGreater(sat["A"], 0.5)  # A has evidence; must be above floor
+
+    def test_unknown_floor_zero_preserves_old_behaviour(self):
+        # unknown_floor=0.0 keeps the old behaviour: silent candidates score 0.
+        from src.ranking import CoverageReranker, NeedSatisfactionScorer
+        cat = {"A": {"title": "blue jacket"}, "B": {"title": "red hat"}}
+        scorer = NeedSatisfactionScorer(CoverageReranker(cat), unknown_floor=0.0)
+        _order, sat = scorer.rank(["A", "B"], ["completely unrelated xyz phrase"])
+        self.assertAlmostEqual(sat["A"], 0.0)
+        self.assertAlmostEqual(sat["B"], 0.0)
+
+
+class RetrievalGuardTest(unittest.TestCase):
+    """guard_retrieval_head: force-keep retrieval top-K in visible window."""
+
+    def _guard(self, retrieval, ranked, k=3, visible=5):
+        from src.ranking import guard_retrieval_head
+        return guard_retrieval_head(retrieval, ranked, k, visible)
+
+    def test_retrieval_top_preserved_when_ranked_out(self):
+        # Retrieval placed A at rank 0, ranker pushed it to rank 5 (outside visible 5).
+        retrieval = ["A", "B", "C", "D", "E", "F"]
+        ranked    = ["X", "Y", "Z", "W", "V", "A", "B", "C", "D", "E"]
+        order, inserted = self._guard(retrieval, ranked)
+        self.assertIn("A", order[:5])
+        self.assertIn("A", inserted)
+
+    def test_already_present_not_duplicated(self):
+        retrieval = ["A", "B", "C"]
+        ranked    = ["A", "B", "C", "D", "E"]
+        order, inserted = self._guard(retrieval, ranked)
+        self.assertEqual(inserted, [])
+        self.assertEqual(order[:3], ["A", "B", "C"])
+
+    def test_order_within_window_preserves_ranked_order(self):
+        # After guard inserts A back in, the window must stay in ranked_order score order.
+        retrieval = ["A", "B", "C", "D", "E"]
+        ranked    = ["C", "D", "E", "F", "G", "A", "B"]
+        order, inserted = self._guard(retrieval, ranked, k=2, visible=5)
+        # All inserted must appear within visible_k=5.
+        for a in inserted:
+            self.assertIn(a, order[:5])
+        # Score order preserved: C before D before E within visible.
+        visible = order[:5]
+        if "C" in visible and "D" in visible:
+            self.assertLess(visible.index("C"), visible.index("D"))
+
+    def test_guard_k_zero_is_noop(self):
+        retrieval = ["A", "B", "C"]
+        ranked    = ["X", "Y", "Z", "A", "B"]
+        order, inserted = self._guard(retrieval, ranked, k=0)
+        self.assertEqual(order, ranked)
+        self.assertEqual(inserted, [])
 
 
 class AdaptivePriorTest(unittest.TestCase):

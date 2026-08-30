@@ -18,11 +18,14 @@ from src.config import (
     COVERAGE_PREFIX_CHARS, SUPPRESS_POP_ON_PARAPHRASE,
     COVERAGE_RETRIEVAL_WEIGHT, DIVERSITY_HEAD_KEEP, DIVERSITY_LAMBDA, EXPANSION_WEIGHT,
     CE_BETA, CE_CONVEX_GATE_MARGIN, USE_CE_CONVEX, USE_NL_CONSTRAINTS,
+    USE_REGIME_ROUTING, REGIME_LEAKY_MIN_EXACT,
     LLM_RERANK_DEPTH, LLM_WEIGHT, POOL_BY_PHASE, POOL_NO_PERSONALIZATION, POOL_SIZE,
     PRICE_PROXIMITY_WEIGHT, RERANK_NEAR_TIE_MARGIN, REVEAL_CONFIDENCE, REVEAL_HOLDBACK_K,
+    RETRIEVAL_GUARD_K, RETRIEVAL_GUARD_MAX_EXACT, RETRIEVAL_GUARD_VISIBLE_K, USE_RETRIEVAL_GUARD,
+    USE_CATEGORY_SWITCH_CLEAR, USE_PROFILE_NEGATION_PURGE,
     SATISFACTION_POP_CHANNEL, SATISFACTION_POP_WEIGHT, SATISFACTION_QUALITY_CHANNEL,
     SATISFACTION_SEM_ALPHA, SATISFACTION_SEM_GATE_HIGH, SATISFACTION_SEM_GATE_LOW,
-    SATISFACTION_SPECIFICITY_REF,
+    SATISFACTION_SPECIFICITY_REF, SATISFACTION_UNKNOWN_FLOOR,
     SEMANTIC_COVERAGE_GATE, SEMANTIC_COVERAGE_WEIGHT, SESSION_MAX_TURNS,
     LTR_MODEL_PATH, SLOT_DECAY, STRUCTURED_COVERAGE_WEIGHT, USE_ADAPTIVE_CLARIFY,
     USE_CATEGORY_GATE, USE_LTR,
@@ -35,7 +38,8 @@ from src.dialogue import (
     ConversationState, IntentRouter, compose_message, extract_constraints,
     next_ask, phase_transition,
 )
-from src.ranking import CoverageReranker, Diversifier, NeedSatisfactionScorer, Personalizer
+from src.ranking import (CoverageReranker, Diversifier, NeedSatisfactionScorer, Personalizer,
+                         guard_retrieval_head)
 from src.retrieval import VectorRetriever, convex_fuse, rrf, vector_weight
 from src.trace import Tracer, get_tracer
 from src.understanding import (
@@ -122,6 +126,15 @@ class Agent:
     SATISFACTION_QUALITY_CHANNEL = SATISFACTION_QUALITY_CHANNEL
     SATISFACTION_SEM_GATE_LOW = SATISFACTION_SEM_GATE_LOW
     SATISFACTION_SEM_GATE_HIGH = SATISFACTION_SEM_GATE_HIGH
+    SATISFACTION_UNKNOWN_FLOOR = SATISFACTION_UNKNOWN_FLOOR  # neutral score for catalog-silent cands
+    # Correction rules: (b) category-switch clears stale modifiers; (c) negation purge from profile.
+    USE_CATEGORY_SWITCH_CLEAR = USE_CATEGORY_SWITCH_CLEAR
+    USE_PROFILE_NEGATION_PURGE = USE_PROFILE_NEGATION_PURGE
+    # Retrieval guard: force-keep hybrid retrieval's top-K in the visible window on clean turns.
+    USE_RETRIEVAL_GUARD = USE_RETRIEVAL_GUARD
+    RETRIEVAL_GUARD_K = RETRIEVAL_GUARD_K
+    RETRIEVAL_GUARD_VISIBLE_K = RETRIEVAL_GUARD_VISIBLE_K
+    RETRIEVAL_GUARD_MAX_EXACT = RETRIEVAL_GUARD_MAX_EXACT
     USE_LTR = USE_LTR                                           # learned re-ranker (off; experimental)
     LTR_MODEL_PATH = LTR_MODEL_PATH
     # Fix 3 — cap the popularity term so ultra-popular lookalikes cannot bury a low-pop target.
@@ -159,7 +172,11 @@ class Agent:
     # cost. False → legacy RRF fusion (the shipped default).
     USE_CE_CONVEX = USE_CE_CONVEX
     CE_BETA = CE_BETA
-    CE_CONVEX_GATE_MARGIN = CE_CONVEX_GATE_MARGIN
+    CE_CONVEX_GATE_MARGIN = CE_CONVEX_GATE_MARGIN  # legacy fallback (used when USE_REGIME_ROUTING=False)
+    # Regime routing: evidence-based CE-convex gate. Leaky turn (≥REGIME_LEAKY_MIN_EXACT exact
+    # phrases) → RRF/coverage path; clean turn → CE-convex safe to fire.
+    USE_REGIME_ROUTING = USE_REGIME_ROUTING
+    REGIME_LEAKY_MIN_EXACT = REGIME_LEAKY_MIN_EXACT
     USE_LLM_RERANK = False          # Gemini reranker; off (rate-limited)
     LLM_RERANK_DEPTH = LLM_RERANK_DEPTH
     LLM_WEIGHT = LLM_WEIGHT
@@ -318,6 +335,7 @@ class Agent:
             quality_channel=self.SATISFACTION_QUALITY_CHANNEL,
             sem_gate_low=self.SATISFACTION_SEM_GATE_LOW,
             sem_gate_high=self.SATISFACTION_SEM_GATE_HIGH,
+            unknown_floor=self.SATISFACTION_UNKNOWN_FLOOR,
         )
         return self._satisfaction
 
@@ -378,6 +396,8 @@ class Agent:
         if self.USE_NEED_MODEL:
             regex_constraints = self._slot_filler.parse(user_message, turn)
             state.need.revise(regex_constraints)
+            if self.USE_PROFILE_NEGATION_PURGE:
+                self._purge_negated_profile_tags(state)  # rule (c): mask retired profile tags
             # LLM slot extraction as fallback: covers natural language the regex misses
             # ("budget-friendly", "my daughter's recital", "warm without the itch").
             # Context-aware — passes the conversation, known slots, and category so vague
@@ -394,6 +414,8 @@ class Agent:
                         slot=raw["slot"], value=raw["value"],
                         polarity=raw["polarity"], weight=0.8, turn=turn,
                     )])
+            if self.USE_PROFILE_NEGATION_PURGE:
+                self._purge_negated_profile_tags(state)  # re-run after LLM may add negatives
 
         if self.USE_INTENT_ROUTING:
             distinct = len(set(terms(state.query_text())))
@@ -559,20 +581,37 @@ class Agent:
                 state.query_text(), base, self.CE_DEPTH)
             if ce_scores:
                 ce_score_map = {base[i]: ce_scores[i] for i in range(len(ce_scores))}
-                gated_convex = self.USE_CE_CONVEX and (
-                    self.CE_CONVEX_GATE_MARGIN <= 0
-                    or state.belief.margin < self.CE_CONVEX_GATE_MARGIN)
-                if gated_convex:
-                    # Score-aware fusion: blend normalized satisfaction (cov_scores) + CE magnitudes
-                    # over the CE head. Uses the CE's precision score, not just its rank order (RRF).
-                    # Gated to low-margin (contested/paraphrase) turns so confident verbatim turns
-                    # keep RRF and the leaky public signal is not diluted.
+                # Regime routing: gate CE-convex on actual catalog evidence, not a noisy proxy.
+                # Leaky turn (verbatim phrases found in catalog) → RRF to preserve verbatim signal.
+                # Clean turn (paraphrase / natural language) → convex fusion is safe to enable.
+                if self.USE_REGIME_ROUTING and rank_phrases:
+                    leaky_counts = self._coverage.exact_match_counts(
+                        base[:len(ce_scores)], rank_phrases)
+                    is_leaky_turn = max(leaky_counts.values(), default=0) >= self.REGIME_LEAKY_MIN_EXACT
+                elif self.USE_REGIME_ROUTING and not rank_phrases:
+                    # No phrases → no evidence to classify the turn; default conservative (RRF).
+                    # Firing CE-convex on a turn with no rank_phrases means blending empty cov_scores
+                    # with CE scores, effectively ranking by CE alone — noisy on vague initial queries
+                    # and the main cause of public browsing/override MRR regression on turn 1.
+                    is_leaky_turn = True
+                else:
+                    # USE_REGIME_ROUTING=False: fallback to the old belief-margin gate.
+                    is_leaky_turn = (self.CE_CONVEX_GATE_MARGIN > 0
+                                     and state.belief.margin >= self.CE_CONVEX_GATE_MARGIN)
+                use_convex = self.USE_CE_CONVEX and not is_leaky_turn
+                if use_convex:
+                    # Score-aware fusion: blend normalized satisfaction + CE magnitudes.
+                    # Safe on clean turns; the regime detector ensures leaky turns never reach here.
                     candidates = convex_fuse(base, cov_scores, ce_scores, self.CE_BETA)
                 else:
                     head = base[:len(ce_scores)]
                     ce_order = sorted(range(len(head)), key=lambda i: -ce_scores[i])
                     candidates = rrf(base, [head[i] for i in ce_order],
                                      self.CE_WEIGHT, top_n=len(base))
+                if self._tracer.enabled:
+                    self._tracer.note(
+                        f"CE fusion: regime={'leaky' if is_leaky_turn else 'clean'} "
+                        f"convex={use_convex}")
 
         if self._llm_reranker is not None and candidates and near_tie:
             base = list(candidates)
@@ -589,6 +628,21 @@ class Agent:
                 retrieval_order, satisfaction_scores=cov_scores, ce_scores=ce_score_map,
                 phrases=state.constraint_phrases, budget=budget_val,
                 category=state.need.category)
+
+        # Retrieval-guard head: force-keep hybrid retrieval's top-K inside the visible window when
+        # no exact catalog evidence exists.  Retrieval consensus is reliable; noisy absolute cosine
+        # should not eject a rank-1 retrieval hit from the top-10 response. Disabled as soon as
+        # exact phrases are found so the verbatim public-leak path retains full control.
+        if self.USE_RETRIEVAL_GUARD and len(candidates) > 1 and rank_phrases:
+            exact_counts = self._coverage.exact_match_counts(
+                candidates[:self.RETRIEVAL_GUARD_VISIBLE_K], rank_phrases)
+            max_exact = max(exact_counts.values(), default=0)
+            if max_exact <= self.RETRIEVAL_GUARD_MAX_EXACT:
+                candidates, _guarded = guard_retrieval_head(
+                    retrieval_order, candidates,
+                    self.RETRIEVAL_GUARD_K, self.RETRIEVAL_GUARD_VISIBLE_K)
+                if self._tracer.enabled and _guarded:
+                    self._tracer.note(f"retrieval guard inserted {len(_guarded)}: {_guarded}")
 
         if self._tracer.enabled:
             self._tracer.stage(
@@ -718,7 +772,32 @@ class Agent:
             return top_k
         return min(top_k, self.REVEAL_HOLDBACK_K)
 
-    def _nl_rank_phrases(self, state: ConversationState) -> list[str]:
+    @staticmethod
+    def _purge_negated_profile_tags(state: "ConversationState") -> None:
+        """Rule (c): remove profile preference tags whose tokens overlap a live negative constraint.
+
+        A durable profile tag (e.g. 'hiking') must not survive a live correction ('running shoes').
+        We compare TOKEN_RE tokens of each negative value against each tag; any tag that shares a
+        token with a newly negated value is removed from the session's user_profile so the flat
+        popularity pre-sort cannot re-inject it. Session-scoped mutation only — no persistent write.
+        """
+        negatives = state.need.negatives()
+        if not negatives:
+            return
+        from src.catalog import TOKEN_RE as _tre
+        neg_tokens: set[str] = set()
+        for c in negatives:
+            if c.value:
+                neg_tokens.update(_tre.findall(c.value.lower()))
+        if not neg_tokens:
+            return
+        tags = list(state.user_profile.get("preference_tags") or [])
+        filtered = [t for t in tags
+                    if not neg_tokens.intersection(_tre.findall(str(t).lower()))]
+        if len(filtered) < len(tags):
+            state.user_profile = {**state.user_profile, "preference_tags": filtered}
+
+    def _nl_rank_phrases(self, state: "ConversationState") -> list[str]:
         """Ranking phrases derived from the structured NeedModel, for natural-language turns that
         carry no simulator constraint marker. Each positive slot value (except budget, handled via
         price proximity) becomes a phrase the satisfaction/coverage ranker matches lexically and

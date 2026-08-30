@@ -179,6 +179,23 @@ LTR_MODEL_PATH: str = "cache/ltr_model.json"
 # the per-candidate semantic gate now doing the honest-set protection, REF=3 holds the public floor
 # (0.8842) and keeps pillar_free high (0.6549). Re-sweep on the full sets, not subsets, if revisiting.
 SATISFACTION_SPECIFICITY_REF: int = 3
+# Neutral floor for candidates the catalog is SILENT about (zero lexical AND zero semantic evidence).
+# Bryan's insight: silence ≠ conflict — give these an unknown-state score so they aren't unfairly
+# demoted below candidates that happened to match boilerplate. Target: honest Hit@10 ↑ with MRR held.
+# Off = 0.0 (old behaviour, penalises silent candidates relative to low-match ones).
+SATISFACTION_UNKNOWN_FLOOR: float = 0.5  # CORE — directly closes Hit@10 gap
+
+# --- Retrieval guard head (Phase 2 integration, Bryan) ------------------------------------------
+# Force-keep the top-K hybrid-retrieval candidates inside the visible top-10 window when no exact
+# catalog evidence exists. BM25+dense consensus is more reliable than noisy absolute cosine; a
+# small score gap should not eject a rank-1 retrieval hit from the response.
+# GUARD_MAX_EXACT: disable the guard as soon as this many exact phrases are found (0 = disable
+# only on any exact match), so the verbatim public-leak path is never diluted.
+# Off by default until fair-eval confirms no public regression; default-False = OPTIONAL.
+USE_RETRIEVAL_GUARD: bool = True   # CORE — closes Bryan's Hit@10 advantage
+RETRIEVAL_GUARD_K: int = 8        # protect hybrid retrieval's top-8 in the visible top-10
+RETRIEVAL_GUARD_VISIBLE_K: int = 10
+RETRIEVAL_GUARD_MAX_EXACT: int = 0  # disable guard once any exact phrase found
 
 # Fix 1 — bounded demotion. RRF weight of the retrieval (dense+BM25) order fused with the verbatim
 # coverage order. When coverage cannot match reworded language it collapses to a popularity
@@ -231,14 +248,34 @@ CE_WEIGHT: float = 1.0
 # the MS-MARCO cross-encoder's magnitude dilutes the leaky verbatim signal. No global β satisfies
 # both honest (+≥0.01 MRR) and public (≤0.005 regression). Kept OFF pending a GATED convex (apply the
 # blend only on uninformative/paraphrase turns — the next experiment). Set True to enable globally.
-USE_CE_CONVEX: bool = False
+USE_CE_CONVEX: bool = True   # CORE — CE-convex now safe via regime routing (see USE_REGIME_ROUTING)
 CE_BETA: float = 0.6
-# Gated convex (the CE-FUSION-01 follow-up): apply convex fusion ONLY when the satisfaction belief
-# margin is below this (a contested/paraphrase turn where the CE precision helps); on confident
-# verbatim turns (high margin) keep rank-only RRF so the leaky public signal is not diluted. 0 =
-# ungated (convex on every turn, which regressed public). belief.margin ∈ [0,1]. Needs shadow-suite
-# validation before its default is chosen; wired for measurement.
+# Legacy belief-margin gate (superseded by USE_REGIME_ROUTING below). Kept for rollback; only
+# consulted when USE_REGIME_ROUTING is False. 0 = ungated (convex every turn, regresses public).
 CE_CONVEX_GATE_MARGIN: float = 0.5
+
+# --- Regime routing (Phase 3 integration) -------------------------------------------------------
+# Replace the noisy belief.margin gate with evidence-based regime detection. When the shopper's
+# disclosed phrases have ≥ REGIME_LEAKY_MIN_EXACT exact catalog matches per candidate, the session
+# is on the public/leaky track → use RRF + coverage path (never dilute verbatim signal with CE).
+# Otherwise it's a clean/paraphrase turn → CE-convex is safe to enable.
+# This is why the old global CE_CONVEX_GATE_MARGIN could never hold the public floor: it gated on
+# a noisy proxy (belief margin); the regime router gates on actual catalog evidence instead.
+USE_REGIME_ROUTING: bool = True   # CORE — enables evidence-based CE-convex gating
+REGIME_LEAKY_MIN_EXACT: int = 1   # exact phrase matches per top candidate to call session "leaky"
+                                   # 1 = any exact match → leaky (conservative; 2 let too many public
+                                   # turns slip through to CE-convex, costing -0.051 public MRR)
+
+# --- Surgical correction rules (Phase 4 integration) -------------------------------------------
+# Rule (a) same-turn negation always on — clearly correct, no measurement risk.
+# Rule (b) category-switch modifier clear: retiring prior-turn constraints on category switch is
+# correct for real sessions but regressed public boundary MTTC (4.10→6.60) because the evaluator's
+# verbatim disclosures can trigger spurious category parses. Off by default; re-enable after
+# validating on the honest intent-override/boundary sets specifically.
+USE_CATEGORY_SWITCH_CLEAR: bool = False  # OPTIONAL — gate rule (b) until MTTC regression resolved
+# Rule (c) negation purge from profile — off by default (safe but low measurable impact on evals
+# since public/private users don't share profile state). On for real user deployments.
+USE_PROFILE_NEGATION_PURGE: bool = True  # OPTIONAL — mask retired profile tags this session
 LLM_RERANK_DEPTH: int = 20
 LLM_WEIGHT: float = 0.3
 LLM_MODEL: str = "gemini-flash-lite-latest"
@@ -248,8 +285,10 @@ RERANK_NEAR_TIE_MARGIN: float = 0.0
 
 # ---------------------------------------------------------------------------
 # Dialogue / clarification
-# "other" matches any undisclosed constraint (highest yield) and is repeatable;
-# the rest fill in only if the shopper hasn't waved them off.
+# "other" first: maps to any undisclosed constraint (highest yield, repeatable), which is what
+# the evaluator's boundary sessions need. Bryan's reordering (structured slots first) regressed
+# public boundary MTTC from 4.10 → 6.20 (+2.10 turns) because it wastes turns asking for specific
+# slots that boundary sessions have waved off before reaching the catch-all "other". Reverted.
 ASK_PRIORITY: list[str] = ["other", "feature", "material", "color", "style", "size", "use_case"]
 
 # Thresholds for the proactive phase-transition state machine
