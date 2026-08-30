@@ -217,6 +217,17 @@ def test_query_is_structured_only_and_never_raw_transcript():
     assert "gimmie" not in state.query_text()
 
 
+def test_leaky_query_switch_uses_raw_accumulated_history_only_when_marked():
+    state = ConversationState(user_profile={})
+    state.accumulate("I want a red dress", turn=1)
+    state.need.revise(SlotFiller().parse(state.all_text[-1], turn=1))
+    state.accumulate("actually make that a blue shoe", turn=2)
+    state.need.revise(SlotFiller().parse(state.all_text[-1], turn=2))
+    assert state.query_text() == "shoe blue"
+    state.leaky_evidence = True
+    assert state.query_text() == "I want a red dress actually make that a blue shoe"
+
+
 def test_active_session_constraints_filter_conflicting_durable_profile_tags():
     from src.agent import Agent
     from src.context_engine import ProfilePreference, UserProfile

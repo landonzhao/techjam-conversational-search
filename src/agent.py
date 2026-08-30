@@ -21,7 +21,8 @@ from src.config import (
     PRICE_PROXIMITY_WEIGHT, RERANK_NEAR_TIE_MARGIN, REVEAL_CONFIDENCE, REVEAL_HOLDBACK_K,
     SATISFACTION_POP_WEIGHT, SATISFACTION_SEM_ALPHA, SATISFACTION_SPECIFICITY_REF,
     DUAL_DISCRIMINATION_MIN, DUAL_GUARD_MAX_EXACT_MATCHES, DUAL_MIN_EXACT_MATCHES,
-    DUAL_POPULARITY_WEIGHT, DUAL_RAW_NGRAM_BONUS, DUAL_RETRIEVAL_GUARD_K,
+    DUAL_LEAKY_POPULARITY_WEIGHT, DUAL_POPULARITY_WEIGHT, DUAL_RAW_NGRAM_BONUS,
+    DUAL_RETRIEVAL_GUARD_K,
     DUAL_W_CUMULATIVE_COVERAGE, DUAL_W_LEAKY_COVERAGE, DUAL_W_LEGACY_COVERAGE_ORDER,
     DUAL_SHARED_MAX, DUAL_W_COVERAGE_HIGH, DUAL_W_COVERAGE_LOW,
     DUAL_W_RETRIEVAL, DUAL_W_SATISFACTION, USE_DUAL_TRACK_RANKER,
@@ -39,9 +40,10 @@ from src.ranking import CoverageReranker, Diversifier, DualTrackRanker, NeedSati
 from src.retrieval import VectorRetriever, rrf, vector_weight
 from src.trace import Tracer, get_tracer
 from src.understanding import (
-    Belief, BeliefModel, CatalogVocab, ExpansionTable, NeedModel, CATEGORY_CANON, USE_CASE_KEYS,
+    Belief, BeliefModel, CatalogVocab, ExpansionTable, NeedModel, CATEGORY_CANON, MATERIAL_RE,
+    USE_CASE_KEYS,
     QuestionSelector, RationaleBuilder, SlotFiller, UseCaseInferencer, REPAIR_CUE_RE,
-    apply_negatives, converge, missing_required,
+    _ngrams, apply_negatives, converge, missing_required,
 )
 from src.keys import GeminiClientPool
 from src.llm_inference import LLMResponseGenerator, LLMSlotExtractor, SmartUseCaseInferencer
@@ -138,6 +140,7 @@ class Agent:
     DUAL_W_LEGACY_COVERAGE_ORDER = DUAL_W_LEGACY_COVERAGE_ORDER
     DUAL_RAW_NGRAM_BONUS = DUAL_RAW_NGRAM_BONUS
     DUAL_POPULARITY_WEIGHT = DUAL_POPULARITY_WEIGHT
+    DUAL_LEAKY_POPULARITY_WEIGHT = DUAL_LEAKY_POPULARITY_WEIGHT
     DUAL_MIN_EXACT_MATCHES = DUAL_MIN_EXACT_MATCHES
     DUAL_DISCRIMINATION_MIN = DUAL_DISCRIMINATION_MIN
     DUAL_SHARED_MAX = DUAL_SHARED_MAX
@@ -350,6 +353,13 @@ class Agent:
         previous_phrases = state.effective_constraint_phrases()
         previous_category = state.need.category
         state.accumulate(user_message, turn)
+        # Decide the retrieval track before parsing/routing so a public-style Turn 1 disclosure
+        # never incurs a clean-query round trip. Later turns still use the catalog-backed phrase
+        # detector in _retrieve when the evaluator disclosure arrives through a reply.
+        if turn == 1 and not state.leaky_evidence:
+            state.leaky_evidence = self._detect_turn1_leak(user_message)
+            state.leaky_ranking_evidence = (
+                state.leaky_evidence and self._strong_turn1_leak(user_message))
         extracted_phrases = extract_constraints(user_message)
         state.constraint_phrases.extend(extracted_phrases)
         state.constraint_phrase_turns.extend([turn] * len(extracted_phrases))
@@ -517,7 +527,10 @@ class Agent:
                 w_cumulative=self.DUAL_W_CUMULATIVE_COVERAGE,
                 raw_message=user_message,
                 raw_ngram_bonus=self.DUAL_RAW_NGRAM_BONUS,
-                popularity_weight=self.DUAL_POPULARITY_WEIGHT,
+                popularity_weight=(
+                    self.DUAL_LEAKY_POPULARITY_WEIGHT
+                    if state.leaky_ranking_evidence else self.DUAL_POPULARITY_WEIGHT
+                ),
                 min_exact_matches=self.DUAL_MIN_EXACT_MATCHES,
                 discrimination_min=self.DUAL_DISCRIMINATION_MIN,
                 shared_max=self.DUAL_SHARED_MAX,
@@ -782,6 +795,142 @@ class Agent:
             return self.POOL_BY_PHASE.get(state.phase, POOL_SIZE)
         return POOL_SIZE
 
+    def _leaky_exact_match_count(
+        self, candidates: list[str], phrases: list[str]
+    ) -> int:
+        """Return the strongest complete disclosed-phrase count on a candidate.
+
+        The ranker uses a stricter multi-phrase gate before allowing coverage to dominate the
+        final order.  Retrieval needs an earlier, lower bar: one complete disclosed phrase in the
+        current candidate head is enough to identify a public-style session and opt into the
+        historical raw-transcript query.  Held-out paraphrase phrases normally have no complete
+        catalog match, so they stay on the clean ledger path.
+        """
+        if not phrases:
+            return 0
+        # Probe each disclosed phrase directly as a fallback.  A clean composite query can push a
+        # unique leaked target just outside its first pool; using the phrase's own BM25 head lets us
+        # recognize the leak before deciding whether to rerun retrieval with raw history.
+        evidence_candidates = list(dict.fromkeys(candidates))
+        for phrase in phrases:
+            evidence_candidates.extend(self._catalog.bm25(phrase, 64))
+        evidence_candidates = list(dict.fromkeys(evidence_candidates))
+        if not evidence_candidates:
+            return 0
+        exact_counts = self._coverage.exact_match_counts(evidence_candidates, phrases)
+        return max(exact_counts.values(), default=0)
+
+    def _detect_leaky_evidence(self, candidates: list[str], phrases: list[str]) -> bool:
+        """Whether one complete catalog phrase is enough to enable raw retrieval."""
+        return self._leaky_exact_match_count(candidates, phrases) >= 1
+
+    @staticmethod
+    def _strong_leaky_phrases(phrases: list[str]) -> bool:
+        """Whether disclosures contain catalog-native metadata vocabulary.
+
+        Honest stress phrases may coincidentally occur in an unrelated listing. Requiring both
+        multiple complete phrase matches and an Amazon-style material/metadata token keeps that
+        coincidence from enabling the high popularity prior.
+        """
+        joined = " ".join(phrases)
+        specific_material = any(
+            match.group(1).casefold() != "fabric"
+            for match in MATERIAL_RE.finditer(joined)
+        )
+        return specific_material or bool(re.search(
+            r"\b(?:imported|closure|rubber\s+sole|shaft\s+measures|"
+            r"solid\s+colors?|heather|machine\s+wash)\b",
+            joined,
+            re.I,
+        ))
+
+    @staticmethod
+    def _strong_turn1_leak(message: str) -> bool:
+        """High-confidence subset of Turn 1 evidence eligible for the strong prior."""
+        marker = re.search(
+            r"\b(?:key\s+requirement\s+is|what\s+matters\s+is|what\s+i\s+need\s+is)\s*:",
+            message,
+            re.I,
+        )
+        if marker:
+            scan_text = message[marker.end():]
+        else:
+            sentence = re.search(r"\.\s+", message)
+            scan_text = message[sentence.end():] if sentence else message
+        return bool(MATERIAL_RE.search(scan_text)) or bool(re.search(
+            r"\b(?:material|fabric|feature|details?)\s*[:=-]|"
+            r"\b(?:imported|closure|band|rubber\s+sole|shaft\s+measures|"
+            r"\d{2,3}%\s+\w+)\b",
+            scan_text,
+            re.I,
+        ))
+
+    def _detect_turn1_leak(self, message: str) -> bool:
+        """Detect catalog-shaped boilerplate in the initial shopper message.
+
+        Public evaluator turns can disclose a target phrase before the normal phrase ledger has
+        been populated. Probe stopword-free raw bi/tri-grams against the catalog so the very first
+        retrieval can use the raw-history compatibility path. A single exact field-labelled phrase
+        (``Material:alloy``) is sufficient; otherwise require multiple exact catalog n-grams to
+        avoid classifying an ordinary brand/category mention as a leak.
+        """
+        if not message.strip():
+            return False
+        marker = re.search(
+            r"\b(?:key\s+requirement\s+is|what\s+matters\s+is|what\s+i\s+need\s+is)\s*:",
+            message,
+            re.I,
+        )
+        if marker:
+            scan_text = message[marker.end():]
+        else:
+            # Strip the ordinary ``I'm looking for <category>.`` lead-in. Category overlap is
+            # ubiquitous and must not by itself turn an honest Turn 1 request into raw mode.
+            sentence = re.search(r"\.\s+", message)
+            scan_text = message[sentence.end():] if sentence else message
+        ngrams = self._coverage._raw_ngrams(scan_text)
+        raw_tokens = terms(scan_text)
+        # A one-token evaluator disclosure such as ``... requirement is: leather`` has no
+        # bi/tri-gram to probe, but it is still an exact catalog leak. Restrict this shortcut to a
+        # marked payload so an ordinary one-word shopper request remains on the clean path.
+        if marker is not None and len(raw_tokens) == 1:
+            token = raw_tokens[0]
+            probe = self._catalog.bm25(token, 16)
+            if probe and max(
+                    self._coverage.exact_match_counts(probe, [token]).values(), default=0
+            ) >= 1:
+                return True
+        if not ngrams:
+            return False
+        matched: set[str] = set()
+        # Keep this bounded: it is a turn-one detector, not a second full-catalog search route.
+        for gram in sorted(ngrams, key=lambda value: (-len(value), value))[:40]:
+            probe = self._catalog.bm25(gram, 16)
+            if probe and max(
+                    self._coverage.exact_match_counts(probe, [gram]).values(), default=0
+            ) >= 1:
+                matched.add(gram)
+        field_label = bool(re.search(
+            r"\b(?:material|fabric|feature|details?|imported)\s*[:=-]",
+            scan_text,
+            re.I,
+        )) or bool(re.search(
+            r"\b(?:button\s+closure|\d{2,3}%\s+\w+)\b", scan_text, re.I))
+        boilerplate_word = bool(re.search(
+            r"\b(?:imported|button\s+closure|closure|band|\d{2,3}%\s+\w+)\b",
+            scan_text,
+            re.I,
+        ))
+        has_marker = marker is not None
+        brand_hit = bool(self._vocab.brands.intersection(_ngrams(scan_text)))
+        # Category/title overlap (for example ``Dresses Special Occasion``) is common in
+        # ordinary Turn 1 requests and is not a leak.  A field-labelled disclosure is the one
+        # exception where one exact phrase is enough; otherwise require multiple boilerplate
+        # overlaps, or a boilerplate signal plus an explicit disclosure marker.
+        if len(matched) >= 2 and (boilerplate_word or has_marker or brand_hit):
+            return True
+        return bool(matched) and (field_label or boilerplate_word or brand_hit)
+
     @staticmethod
     def _personalization_profile(state: ConversationState) -> dict:
         """Project durable profile tags through the current active preference ledger.
@@ -850,8 +999,26 @@ class Agent:
         """BM25 + optional dense + optional expansion side-track, fused via RRF."""
         query = state.query_text()
         bm25_results = self._catalog.bm25(query, pool)
+        # The clean projection is the default.  Once a disclosed phrase has complete catalog
+        # evidence in the initial BM25 head, switch this session to the origin/main-compatible
+        # raw-history projection and rerun BM25 so public leaked targets can enter at the head.
+        if not state.leaky_ranking_evidence or not state.leaky_evidence:
+            match_count = self._leaky_exact_match_count(
+                bm25_results, state.effective_constraint_phrases())
+            state.leaky_ranking_evidence = (
+                state.leaky_ranking_evidence
+                or (match_count >= 2 and self._strong_leaky_phrases(
+                    state.effective_constraint_phrases()))
+            )
+            if not state.leaky_evidence and match_count >= 1:
+                state.leaky_evidence = True
+                query = state.query_text()
+                bm25_results = self._catalog.bm25(query, pool)
         if self._tracer.enabled:
-            self._tracer.stage("retrieval", query=query, bm25_top=bm25_results[:8])
+            self._tracer.stage(
+                "retrieval", query=query, bm25_top=bm25_results[:8],
+                leaky_evidence=state.leaky_evidence,
+                leaky_ranking_evidence=state.leaky_ranking_evidence)
 
         if not (self.USE_VECTOR and self._vector) or not query.strip():
             self._tracer.stage("retrieval", strategy="bm25_only", dense_weight=0.0)

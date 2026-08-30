@@ -37,13 +37,13 @@ CATALOG = "data/catalog.jsonl"
 
 # Named ranking configs, each a dict of agent attributes to set. Unset floor/gate attrs default off.
 CONFIGS = {
-    "no-floor (pure coverage)": dict(COVERAGE_INFORMATIVE_MIN=0.0, COVERAGE_RETRIEVAL_WEIGHT=0.0,
-                                     SUPPRESS_POP_ON_PARAPHRASE=False, USE_SATISFACTION_RANKER=False,
-                                     USE_DUAL_TRACK_RANKER=False),
-    "disc gate + suppress":     dict(COVERAGE_INFORMATIVE_MIN=0.5, COVERAGE_RETRIEVAL_WEIGHT=2.0,
-                                     COVERAGE_DISCRIMINATION_PCTL=0.9, SUPPRESS_POP_ON_PARAPHRASE=True,
-                                     USE_SATISFACTION_RANKER=False, USE_DUAL_TRACK_RANKER=False),
-    "satisfaction (Phase 1)":   dict(USE_SATISFACTION_RANKER=True, USE_DUAL_TRACK_RANKER=False),
+#    "no-floor (pure coverage)": dict(COVERAGE_INFORMATIVE_MIN=0.0, COVERAGE_RETRIEVAL_WEIGHT=0.0,
+#                                     SUPPRESS_POP_ON_PARAPHRASE=False, USE_SATISFACTION_RANKER=False,
+#                                     USE_DUAL_TRACK_RANKER=False),
+#    "disc gate + suppress":     dict(COVERAGE_INFORMATIVE_MIN=0.5, COVERAGE_RETRIEVAL_WEIGHT=2.0,
+#                                     COVERAGE_DISCRIMINATION_PCTL=0.9, SUPPRESS_POP_ON_PARAPHRASE=True,
+#                                     USE_SATISFACTION_RANKER=False, USE_DUAL_TRACK_RANKER=False),
+#    "satisfaction (Phase 1)":   dict(USE_SATISFACTION_RANKER=True, USE_DUAL_TRACK_RANKER=False),
     "dual-track (P2)":          dict(USE_DUAL_TRACK_RANKER=True),
 }
 
@@ -77,12 +77,14 @@ def set_pop_ablation(agent: Agent, ablate: bool) -> None:
             "tie_break": ranking_mod.COVERAGE_TIE_BREAK,
             "satisfaction_pop_weight": agent._satisfaction.pop_weight,
             "dual_popularity_weight": agent.DUAL_POPULARITY_WEIGHT,
+            "dual_leaky_popularity_weight": agent.DUAL_LEAKY_POPULARITY_WEIGHT,
         }
         agent.COVERAGE_POP_BLEND = 0.0
         ranking_mod.POP_WEIGHT = 0.0
         ranking_mod.COVERAGE_TIE_BREAK = "base"   # tie-break -> incoming retrieval order
         agent._satisfaction.pop_weight = 0.0
         agent.DUAL_POPULARITY_WEIGHT = 0.0
+        agent.DUAL_LEAKY_POPULARITY_WEIGHT = 0.0
     elif hasattr(agent, "_pop_saved"):
         saved = agent._pop_saved
         agent.COVERAGE_POP_BLEND = saved["coverage_blend"]
@@ -90,6 +92,7 @@ def set_pop_ablation(agent: Agent, ablate: bool) -> None:
         ranking_mod.COVERAGE_TIE_BREAK = saved["tie_break"]
         agent._satisfaction.pop_weight = saved["satisfaction_pop_weight"]
         agent.DUAL_POPULARITY_WEIGHT = saved["dual_popularity_weight"]
+        agent.DUAL_LEAKY_POPULARITY_WEIGHT = saved["dual_leaky_popularity_weight"]
 
 
 def score_row(agent: Agent, rows: list, cat_ids, cats, prods) -> tuple:

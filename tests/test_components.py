@@ -521,6 +521,28 @@ class DualTrackRankerTest(unittest.TestCase):
         self.assertEqual(order[0], "B")
 
 
+class LeakEvidenceTest(unittest.TestCase):
+    def test_turn_one_metadata_is_strong_but_brand_only_is_not(self):
+        from src.agent import Agent
+
+        self.assertTrue(Agent._strong_turn1_leak(
+            "I'm looking for belts. A key requirement is: Material:alloy."))
+        self.assertTrue(Agent._strong_turn1_leak(
+            "I'm looking for belts. Buckle closure"))
+        self.assertFalse(Agent._strong_turn1_leak(
+            "I'm looking for scarves. A key requirement is: by MYGFDO."))
+
+    def test_paraphrased_generic_fabric_does_not_enable_strong_prior(self):
+        from src.agent import Agent
+
+        self.assertFalse(Agent._strong_leaky_phrases([
+            "made of a synthetic man-made fabric", "not too bulky",
+        ]))
+        self.assertTrue(Agent._strong_leaky_phrases([
+            "Solid colors 100 Cotton", "Imported", "Button closure",
+        ]))
+
+
 class ScenarioMixTest(unittest.TestCase):
     def test_largest_remainder_matches_official_mix(self):
         from scripts.scenario_mix import largest_remainder_counts, scenario_schedule

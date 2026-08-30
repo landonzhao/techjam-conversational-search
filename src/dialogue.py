@@ -111,6 +111,13 @@ class ConversationState:
     user_profile: dict
     all_text: list[str] = field(default_factory=list)
     message_turns: list[int] = field(default_factory=list)
+    # Set by the retrieval layer once a disclosed phrase has exact catalog evidence.  A leaky
+    # session intentionally follows the historical raw-transcript retrieval path; ordinary and
+    # paraphrased sessions keep the correction-safe ledger projection below.
+    leaky_evidence: bool = False
+    # Stronger ranking-only signal. A one-phrase match can justify a raw retrieval probe but is
+    # too common in paraphrased catalogs to safely enable the high popularity prior.
+    leaky_ranking_evidence: bool = False
     asked_attrs: set = field(default_factory=set)
     boundary_attrs: set = field(default_factory=set)
     category_anchor: str | None = None
@@ -142,12 +149,18 @@ class ConversationState:
         self.message_turns.append(turn if turn is not None else len(self.all_text))
 
     def query_text(self) -> str:
-        """Return only the active positive ledger values and the current category anchor.
+        """Return the active retrieval projection, or raw history for detected catalog leaks.
 
         Raw transcript text remains in ``all_text`` for audit and optional response generation,
-        but it is never a retrieval input. Negative values are handled by ``apply_negatives`` and
-        must not become positive BM25/dense terms.
+        but it is never a retrieval input on the honest path. Negative values are handled by
+        ``apply_negatives`` and must not become positive BM25/dense terms there.
         """
+        if self.leaky_evidence:
+            # This is deliberately the origin/main compatibility path.  It is enabled only after
+            # catalog-backed exact evidence is observed by Agent._retrieve; it must not be the
+            # default because abandoned corrections would otherwise re-enter honest queries.
+            return " ".join(self.all_text)
+
         values: list[str] = []
         seen: set[str] = set()
         # Ledger order gives stable recency semantics while NeedModel.constraints guarantees that

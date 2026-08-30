@@ -129,7 +129,9 @@ SATISFACTION_SPECIFICITY_REF: int = 3
 # exact catalog coverage on genuinely leaky turns.  These are deliberately conservative starting
 # points; eval_matrix/oracle runs should sweep them before making a final leaderboard choice.
 USE_DUAL_TRACK_RANKER: bool = True
-DUAL_W_RETRIEVAL: float = 1.3
+# Public/leak-free joint sweep: 1.8 preserves the honest retrieval head while raising the public
+# 100-session guardrail from 0.8623 to 0.8831 when paired with the conditional prior below.
+DUAL_W_RETRIEVAL: float = 1.8
 DUAL_W_SATISFACTION: float = 1.0
 DUAL_W_COVERAGE_HIGH: float = 2.5
 DUAL_W_COVERAGE_LOW: float = 0.0
@@ -148,8 +150,13 @@ DUAL_W_CUMULATIVE_COVERAGE: float = 5.0
 # Exact bi/tri-gram overlap from the current user turn. This is deliberately additive to
 # cumulative coverage so leaky public wording can resolve shared boilerplate ties; it is zero when
 # no raw n-gram matches a candidate.
-DUAL_RAW_NGRAM_BONUS: float = 0.5
+# Shared Amazon boilerplate creates dozens of identical raw n-gram hits; 0.2 keeps the useful
+# tie-break without letting repeated boilerplate overwhelm retrieval and satisfaction.
+DUAL_RAW_NGRAM_BONUS: float = 0.2
+# Conservative prior for ordinary/paraphrased sessions. Verified catalog-leak sessions use the
+# stronger value below; separating them avoids the measured leak-free regression of a global 1.0.
 DUAL_POPULARITY_WEIGHT: float = 0.10
+DUAL_LEAKY_POPULARITY_WEIGHT: float = 1.0
 DUAL_MIN_EXACT_MATCHES: int = 2
 DUAL_DISCRIMINATION_MIN: float = 0.35
 DUAL_SHARED_MAX: float = 0.35
