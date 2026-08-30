@@ -21,7 +21,7 @@ from src.config import (
     PRICE_PROXIMITY_WEIGHT, RERANK_NEAR_TIE_MARGIN, REVEAL_CONFIDENCE, REVEAL_HOLDBACK_K,
     SATISFACTION_POP_WEIGHT, SATISFACTION_SEM_ALPHA, SATISFACTION_SPECIFICITY_REF,
     SEMANTIC_COVERAGE_GATE, SEMANTIC_COVERAGE_WEIGHT, SESSION_MAX_TURNS,
-    SLOT_DECAY, STRUCTURED_COVERAGE_WEIGHT, USE_SATISFACTION_RANKER,
+    SLOT_DECAY, STRUCTURED_COVERAGE_WEIGHT, USE_ADAPTIVE_CLARIFY, USE_SATISFACTION_RANKER,
 )
 from src.context_engine import (
     ContextDistiller, GuidanceLearner, OrchestrationPolicy, ProfileService,
@@ -143,6 +143,7 @@ class Agent:
     USE_NEED_MODEL = True
     USE_ACTIVE_CONVERGENCE = True
     USE_INFO_GAIN_QUESTION = True
+    USE_ADAPTIVE_CLARIFY = USE_ADAPTIVE_CLARIFY   # pool-derived feature-facet questions
     INFO_GAIN_MODE = "display"  # "display" (benchmark-safe) | "ask"
     USE_LLM_SLOTS = True        # LLM slot extraction fallback for natural language constraints
     # LLM slots fire only when the regex extracted fewer than this many constraints (a "regex
@@ -205,6 +206,7 @@ class Agent:
             self._catalog.products, self._coverage.doc, self._vocab)
         self._question_selector = QuestionSelector(
             self._catalog.products, self._coverage.doc, self._vocab.price_quantiles)
+        self._question_selector.adaptive_clarify = self.USE_ADAPTIVE_CLARIFY
         self._rationale = RationaleBuilder(self._catalog.products, self._coverage.doc)
 
         self._vector: VectorRetriever | None = None

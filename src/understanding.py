@@ -545,10 +545,25 @@ def converge(belief: Belief, missing: list[str], turn: int, last_turn: int = 10)
 DECISION_WEIGHT = {"budget": 1.3, "size": 1.2, "material": 1.1, "use_case": 1.0,
                    "category": 1.0, "style": 0.9, "color": 0.8}
 
+# Adaptive clarification (QuestionSelector, USE_ADAPTIVE_CLARIFY). Slots whose values `attr_value`
+# can extract, so `_top_values(head, slot)` being empty means the pool cannot answer that question.
+_EXTRACTED_SLOTS = {"material", "color", "style", "use_case", "size"}
+_WORD_RE = re.compile(r"[a-z0-9]+")
+# Generic, non-discriminating tokens excluded from the pool-derived feature facet.
+_FACET_STOP = {
+    "with", "and", "for", "the", "this", "that", "from", "your", "you", "our", "are", "all",
+    "womens", "women", "mens", "men", "kids", "girls", "boys", "unisex", "size", "sizes",
+    "small", "medium", "large", "pack", "set", "pair", "new", "style", "fashion", "quality",
+    "premium", "classic", "made", "design", "designed", "perfect", "great", "features", "product",
+    "material", "color", "colors", "available", "please", "will", "can", "has", "have",
+}
+
 
 class QuestionSelector:
     """Component A — ask the question that most reduces the belief's uncertainty (PROBE),
     verifies the top hypothesis (CONFIRM), or steps aside (DELIVER). Pool-aware phrasing."""
+
+    adaptive_clarify = False   # set by Agent from config.USE_ADAPTIVE_CLARIFY
 
     def __init__(self, catalog: dict[str, dict], doc_fn, price_q: list[float]) -> None:
         self.catalog = catalog
@@ -570,12 +585,49 @@ class QuestionSelector:
             if cmp:
                 return "other", cmp
         # guidance multiplier is per-slot learned info-gain weight (1.0 when unseen)
-        unc = belief.attr_uncertainty
+        unc = dict(belief.attr_uncertainty)
+        facet_word: str | None = None
+        if self.adaptive_clarify:
+            # (a) drop structured slots the candidate pool has no values for — asking them cannot
+            # discriminate and just burns a turn (a common leak-free/long-tail failure).
+            unc = {s: u for s, u in unc.items()
+                   if s not in _EXTRACTED_SLOTS or self._top_values(head, s)}
+            # (b) add a pool-derived `feature` facet so feature-classified constraints are askable.
+            if not need.has_positive("feature"):
+                facet = self._feature_facet(head, need)
+                if facet:
+                    facet_word, unc["feature"] = facet[0], facet[1]
         if unc:
             g = guidance or {}
             attr = max(unc, key=lambda s: unc[s] * DECISION_WEIGHT.get(s, 1.0) * g.get(s, 1.0))
+            if attr == "feature" and facet_word:
+                return "feature", f"Any particular feature that matters — like {facet_word}?"
             return attr, self._probe_phrase(attr, head)
         return "other", "Is there a specific detail that matters most to you?"
+
+    def _feature_facet(self, head: list[str], need: NeedModel) -> tuple[str, float] | None:
+        """The distinctive token the top candidates most SPLIT on — a facet (waterproof, padded,
+        stone type, closure...) that the fixed structured slots don't capture. Pool-derived, so it is
+        category-adaptive and needs no hand-maintained map. Returns (token, strength) where strength
+        peaks at a 50/50 split (maximal information gain). None if nothing splits the pool."""
+        pool = head[:12]
+        if len(pool) < 4:
+            return None
+        known = {t for c in need.positives() for t in _WORD_RE.findall(c.value.lower())}
+        docs = [set(_WORD_RE.findall(self.doc(a))) for a in pool]
+        counts: Counter[str] = Counter()
+        for d in docs:
+            counts.update(t for t in d if len(t) > 3 and t not in _FACET_STOP and t not in known)
+        n = len(pool)
+        best: tuple[str, float] | None = None
+        for tok, c in counts.items():
+            if c < 2 or c > n - 2:                 # present in ~half → discriminating
+                continue
+            frac = c / n
+            strength = 1.0 - abs(0.5 - frac) * 2.0   # 1.0 at 50/50, 0 at all/none
+            if strength >= 0.5 and (best is None or strength > best[1]):
+                best = (tok, strength)
+        return best
 
     # ---- phrasing (fills specifics from the actual candidate head) ----
     def _top_values(self, head: list[str], slot: str, n: int = 3) -> list[str]:

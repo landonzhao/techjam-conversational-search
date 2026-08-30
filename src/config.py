@@ -189,6 +189,16 @@ REVEAL_CONFIDENCE: float = 0.55      # belief.confidence ≥ this → reveal ful
 REVEAL_HOLDBACK_K: int = 1           # list length while holding back (measured: K=1 best)
 
 # ---------------------------------------------------------------------------
+# Clarification (docs/CLARIFICATION_PLAN.md). Browsing is our weakest honest-set pillar because the
+# belief can only ask about structured slots (material/color/style/use_case) — it can never form a
+# `feature` question, yet most reworded constraints classify as `feature`. When on, the question
+# selector (a) drops structured slots the candidate pool has no values for (asking them can't
+# discriminate) and (b) adds a pool-derived `feature` facet: a distinctive token the top candidates
+# split on, asked as a feature question. Category-adaptive by construction; off by default until
+# measured on pillar_free browsing + the public MTTC guardrail.
+USE_ADAPTIVE_CLARIFY: bool = False
+
+# ---------------------------------------------------------------------------
 # DCP (context engine)
 PROFILE_STORE: str = "cache/profiles.json"
 GUIDANCE_STORE: str = "cache/guidance_global.json"
