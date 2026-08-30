@@ -133,6 +133,14 @@ USE_DUAL_TRACK_RANKER: bool = True
 # 100-session guardrail from 0.8623 to 0.8831 when paired with the conditional prior below.
 DUAL_W_RETRIEVAL: float = 1.8
 DUAL_W_SATISFACTION: float = 1.0
+# Clean-track retrieval uses a normalized 25% BM25 / 75% dense split.  The RRF helper keeps
+# BM25 as the primary route at weight 1.0, so Agent converts this ratio to a dense secondary
+# weight of 0.75 / 0.25 = 3.0.  These knobs are only consulted while leaky_evidence is false.
+DUAL_CLEAN_BM25_WEIGHT: float = 0.25
+DUAL_CLEAN_DENSE_WEIGHT: float = 0.75
+# Semantic satisfaction is more reliable than popularity on the reworded track.  This weight is
+# applied only when the clean session has at least one active ledger/phrase constraint.
+DUAL_CLEAN_W_SATISFACTION: float = 2.0
 DUAL_W_COVERAGE_HIGH: float = 2.5
 DUAL_W_COVERAGE_LOW: float = 0.0
 # Legacy public-leak compatibility: when disclosed phrases have any exact catalog evidence, keep
@@ -218,7 +226,11 @@ RERANK_NEAR_TIE_MARGIN: float = 0.0
 # Dialogue / clarification
 # "other" matches any undisclosed constraint (highest yield) and is repeatable;
 # the rest fill in only if the shopper hasn't waved them off.
-ASK_PRIORITY: list[str] = ["other", "feature", "material", "color", "style", "size", "use_case"]
+# Structured slots come before the generic fallback.  The evaluator maps ask_attribute directly to
+# its next constraint, so emitting ``other`` while a supported slot is available wastes a turn.
+ASK_PRIORITY: list[str] = [
+    "feature", "material", "color", "style", "size", "use_case", "budget", "other",
+]
 
 # Thresholds for the proactive phase-transition state machine
 EXPLORE_TERM_THRESHOLD: int = 6     # distinct query terms below → explore (over-general)

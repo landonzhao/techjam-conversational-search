@@ -25,6 +25,7 @@ from src.config import (
     DUAL_RETRIEVAL_GUARD_K,
     DUAL_W_CUMULATIVE_COVERAGE, DUAL_W_LEAKY_COVERAGE, DUAL_W_LEGACY_COVERAGE_ORDER,
     DUAL_SHARED_MAX, DUAL_W_COVERAGE_HIGH, DUAL_W_COVERAGE_LOW,
+    DUAL_CLEAN_BM25_WEIGHT, DUAL_CLEAN_DENSE_WEIGHT, DUAL_CLEAN_W_SATISFACTION,
     DUAL_W_RETRIEVAL, DUAL_W_SATISFACTION, USE_DUAL_TRACK_RANKER,
     SEMANTIC_COVERAGE_GATE, SEMANTIC_COVERAGE_WEIGHT, SESSION_MAX_TURNS,
     SLOT_DECAY, STRUCTURED_COVERAGE_WEIGHT, USE_ADAPTIVE_CLARIFY, USE_SATISFACTION_RANKER,
@@ -133,6 +134,9 @@ class Agent:
     USE_DUAL_TRACK_RANKER = USE_DUAL_TRACK_RANKER
     DUAL_W_RETRIEVAL = DUAL_W_RETRIEVAL
     DUAL_W_SATISFACTION = DUAL_W_SATISFACTION
+    DUAL_CLEAN_BM25_WEIGHT = DUAL_CLEAN_BM25_WEIGHT
+    DUAL_CLEAN_DENSE_WEIGHT = DUAL_CLEAN_DENSE_WEIGHT
+    DUAL_CLEAN_W_SATISFACTION = DUAL_CLEAN_W_SATISFACTION
     DUAL_W_COVERAGE_HIGH = DUAL_W_COVERAGE_HIGH
     DUAL_W_COVERAGE_LOW = DUAL_W_COVERAGE_LOW
     DUAL_W_CUMULATIVE_COVERAGE = DUAL_W_CUMULATIVE_COVERAGE
@@ -179,7 +183,9 @@ class Agent:
     USE_ACTIVE_CONVERGENCE = True
     USE_INFO_GAIN_QUESTION = True
     USE_ADAPTIVE_CLARIFY = USE_ADAPTIVE_CLARIFY   # pool-derived feature-facet questions
-    INFO_GAIN_MODE = "display"  # "display" (benchmark-safe) | "ask"
+    # Keep the structured information-gain decision in the evaluator-facing action payload. The
+    # old display mode voiced a concrete question but sent ask_attribute="other".
+    INFO_GAIN_MODE = "ask"
     USE_LLM_SLOTS = True        # LLM slot extraction fallback for natural language constraints
     # LLM slots fire only when the regex extracted fewer than this many constraints (a "regex
     # came up short" gate). Raise it (e.g. 99) to run the LLM on every substantive turn.
@@ -515,11 +521,17 @@ class Agent:
                     budget_val = (float(nums[0]) + float(nums[-1])) / 2  # midpoint covers ranges
                     break
         if self.USE_DUAL_TRACK_RANKER and candidates:
+            clean_track = not state.leaky_evidence
+            has_active_constraint = bool(active_ledger_constraints)
             candidates, fusion = self._dual_ranker.rank(
                 candidates, effective_phrases,
                 constraints=active_ledger_constraints,
                 w_ret=self.DUAL_W_RETRIEVAL,
-                w_sat=self.DUAL_W_SATISFACTION,
+                w_sat=(
+                    self.DUAL_CLEAN_W_SATISFACTION
+                    if clean_track and has_active_constraint
+                    else self.DUAL_W_SATISFACTION
+                ),
                 w_cov_high=self.DUAL_W_COVERAGE_HIGH,
                 w_cov_low=self.DUAL_W_COVERAGE_LOW,
                 w_leaky=self.DUAL_W_LEAKY_COVERAGE,
@@ -529,7 +541,9 @@ class Agent:
                 raw_ngram_bonus=self.DUAL_RAW_NGRAM_BONUS,
                 popularity_weight=(
                     self.DUAL_LEAKY_POPULARITY_WEIGHT
-                    if state.leaky_ranking_evidence else self.DUAL_POPULARITY_WEIGHT
+                    if state.leaky_ranking_evidence
+                    else (0.0 if clean_track and has_active_constraint
+                          else self.DUAL_POPULARITY_WEIGHT)
                 ),
                 min_exact_matches=self.DUAL_MIN_EXACT_MATCHES,
                 discrimination_min=self.DUAL_DISCRIMINATION_MIN,
@@ -543,6 +557,8 @@ class Agent:
             if self._tracer.enabled:
                 self._tracer.note(
                     "dual-track fusion: "
+                    f"track={'clean' if clean_track else 'leaky'} "
+                    f"sat_w={fusion.get('satisfaction_weight', self.DUAL_W_SATISFACTION):.2f} "
                     f"coverage_w={fusion.get('coverage_weight', 0.0):.2f} "
                     f"gate={bool(fusion.get('coverage_gate', False))} "
                     f"cumulative_w={fusion.get('cumulative_coverage_weight', 0.0):.2f} "
@@ -1031,6 +1047,14 @@ class Agent:
         else:
             w = vector_weight(state.buying_score, self.USE_INTENT_ROUTING,
                               self.USE_CONFIDENCE_ROUTING)
+
+        # RRF keeps BM25 at weight 1.0.  On a clean session with any active constraint, convert
+        # the requested normalized 25/75 split into the equivalent dense secondary weight.  The
+        # leaky path intentionally retains its existing intent/DCP route weight verbatim.
+        if not state.leaky_evidence and (
+                state.need.positives() or state.effective_constraint_phrases()):
+            bm25_weight = max(1e-9, self.DUAL_CLEAN_BM25_WEIGHT)
+            w = max(0.0, self.DUAL_CLEAN_DENSE_WEIGHT) / bm25_weight
 
         try:
             if SLOT_DECAY < 1.0:

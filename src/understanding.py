@@ -939,7 +939,7 @@ def converge(belief: Belief, missing: list[str], turn: int, last_turn: int = 10)
 
 # Slot decision weights: how much resolving each slot narrows the candidate pool.
 DECISION_WEIGHT = {"budget": 1.3, "size": 1.2, "material": 1.1, "use_case": 1.0,
-                   "category": 1.0, "style": 0.9, "color": 0.8}
+                   "category": 1.0, "feature": 1.0, "style": 0.9, "color": 0.8}
 
 # Adaptive clarification (QuestionSelector, USE_ADAPTIVE_CLARIFY). Slots whose values `attr_value`
 # can extract, so `_top_values(head, slot)` being empty means the pool cannot answer that question.
@@ -972,34 +972,66 @@ class QuestionSelector:
             return None, "Here are the closest matches based on what you've told me."
         if conv_state == "CONFIRM" and belief.top_asin:
             attr = self._distinctive_attr(belief.top_asin, head)
-            if attr:
+            if attr and attr not in need.no_preference:
                 return attr, self._confirm_phrase(attr, belief.top_asin)
         # When top candidates are nearly tied, a product comparison question is more
         # discriminating than asking about an abstract attribute.
         if belief.margin < 0.15 and len(head) >= 2:
             cmp = self._comparison_phrase(head)
             if cmp:
-                return "other", cmp
+                # A comparison prompt still needs a structured evaluator action. Use the most
+                # informative unresolved slot as the payload instead of forcing the simulator's
+                # generic ``other`` response.
+                comparison_attr = self._best_supported_attr(
+                    belief.attr_uncertainty, need, guidance)
+                if comparison_attr:
+                    return comparison_attr, cmp
         # guidance multiplier is per-slot learned info-gain weight (1.0 when unseen)
         unc = dict(belief.attr_uncertainty)
         facet_word: str | None = None
+        unc = {s: u for s, u in unc.items() if s not in need.no_preference}
         if self.adaptive_clarify:
             # (a) drop structured slots the candidate pool has no values for — asking them cannot
             # discriminate and just burns a turn (a common leak-free/long-tail failure).
             unc = {s: u for s, u in unc.items()
                    if s not in _EXTRACTED_SLOTS or self._top_values(head, s)}
             # (b) add a pool-derived `feature` facet so feature-classified constraints are askable.
-            if not need.has_positive("feature"):
+            if not need.has_positive("feature") and "feature" not in need.no_preference:
                 facet = self._feature_facet(head, need)
                 if facet:
                     facet_word, unc["feature"] = facet[0], facet[1]
         if unc:
             g = guidance or {}
-            attr = max(unc, key=lambda s: unc[s] * DECISION_WEIGHT.get(s, 1.0) * g.get(s, 1.0))
+            attr = self._best_supported_attr(unc, need, g)
+            if not attr:
+                return "other", "Is there a specific detail that matters most to you?"
             if attr == "feature" and facet_word:
                 return "feature", f"Any particular feature that matters — like {facet_word}?"
             return attr, self._probe_phrase(attr, head)
         return "other", "Is there a specific detail that matters most to you?"
+
+    @staticmethod
+    def _best_supported_attr(
+        uncertainty: dict[str, float],
+        need: NeedModel,
+        guidance: dict[str, float] | None = None,
+    ) -> str | None:
+        """Choose an unresolved, non-boundary slot suitable for evaluator replies."""
+        weights = guidance or {}
+        candidates = {
+            slot: value for slot, value in uncertainty.items()
+            if slot in DECISION_WEIGHT and slot not in need.no_preference
+        }
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda slot: (
+                candidates[slot] * DECISION_WEIGHT.get(slot, 1.0) * weights.get(slot, 1.0),
+                -list(DECISION_WEIGHT).index(slot)
+                if slot in DECISION_WEIGHT else 0,
+            ),
+        )
 
     def _feature_facet(self, head: list[str], need: NeedModel) -> tuple[str, float] | None:
         """The distinctive token the top candidates most SPLIT on — a facet (waterproof, padded,
@@ -1068,7 +1100,7 @@ class QuestionSelector:
 
     def _distinctive_attr(self, top: str, head: list[str]) -> str | None:
         runners = [a for a in head if a != top][:5]
-        for slot in ("material", "color", "style", "category"):
+        for slot in ("material", "color", "style", "size", "use_case", "budget", "category"):
             tv = attr_value(self.catalog.get(top, {}), slot, self.doc(top), self.price_q)
             if not tv:
                 continue

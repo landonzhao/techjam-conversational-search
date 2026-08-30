@@ -818,6 +818,7 @@ class DualTrackRanker:
             "raw_ngram_bonus": raw_overlap,
             "popularity": popularity,
             "final": final,
+            "satisfaction_weight": float(max(0.0, w_sat)),
             "coverage_weight": float(w_cov),
             "coverage_gate_weight": float(w_cov_gate),
             "leaky_coverage_active": leaky_evidence,

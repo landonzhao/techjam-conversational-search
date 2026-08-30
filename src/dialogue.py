@@ -288,18 +288,25 @@ def phase_transition(
 def next_ask(state: ConversationState, use_info_gain: bool, info_gain_mode: str) -> str | None:
     """Return the attribute to request next.
 
-    In 'display' mode (benchmark-safe): always ask 'other' to maximize constraint
-    extraction; info-gain phrasing is voiced in the message but doesn't change ask_attribute.
-    In 'ask' mode: the info-gain selector drives the actual ask_attribute field.
+    The info-gain selector is authoritative for the evaluator-facing action payload whenever it
+    returns a supported slot. ``info_gain_mode`` is retained for compatibility with older callers,
+    but a display-only mode must never turn a concrete color/size/material decision into
+    ``ask_attribute='other'``: the evaluator uses this field to choose its next structured reply.
     """
-    if use_info_gain and info_gain_mode == "ask":
-        return state.ig_attr
+    if state.conv_state == "DELIVER":
+        return None
+
+    supported = {"budget", "feature", "material", "color", "style", "size", "use_case"}
+    if use_info_gain and state.ig_attr in supported:
+        if state.ig_attr not in state.boundary_attrs and state.ig_attr not in state.need.no_preference:
+            state.asked_attrs.add(state.ig_attr)
+            return state.ig_attr
 
     for attr in ASK_PRIORITY:
+        if attr == "other":
+            continue
         if attr in state.boundary_attrs:
             continue
-        if attr == "other":
-            return attr
         if attr not in state.asked_attrs:
             state.asked_attrs.add(attr)
             return attr
@@ -327,7 +334,10 @@ def compose_message(
     Priority: belief-driven info-gain phrasing (if enabled) > intent-aware
     phrasing > default attribute prompts.
     """
-    if use_info_gain and state.ig_phrasing:
+    # A stale/unsupported selector result must not leave the voiced question out of sync with
+    # ask_attribute. This also prevents a DELIVER turn from emitting an info-gain question after
+    # next_ask() has correctly returned None.
+    if use_info_gain and ask_attr and ask_attr == state.ig_attr and state.ig_phrasing:
         return state.ig_phrasing
     if not ask_attr:
         return "Here are the closest matches I found."

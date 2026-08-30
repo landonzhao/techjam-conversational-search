@@ -579,6 +579,58 @@ class QuestionSelectorFormattingTest(unittest.TestCase):
         self.assertIn("($30)", phrase)
         self.assertNotIn("not available", phrase)
 
+    def test_info_gain_slot_reaches_payload_in_display_mode(self):
+        from src.dialogue import ConversationState, next_ask
+
+        state = ConversationState(user_profile={})
+        state.ig_attr = "color"
+        state.conv_state = "PROBE"
+        self.assertEqual(next_ask(state, True, "display"), "color")
+
+    def test_no_preference_slot_is_not_asked_again(self):
+        from src.dialogue import ConversationState, next_ask
+
+        state = ConversationState(user_profile={})
+        state.ig_attr = "color"
+        state.conv_state = "PROBE"
+        state.need.no_preference.add("color")
+        state.boundary_attrs.add("color")
+        self.assertNotEqual(next_ask(state, True, "display"), "color")
+
+    def test_fallback_prefers_supported_slot_over_other(self):
+        from src.dialogue import ConversationState, next_ask
+
+        state = ConversationState(user_profile={})
+        state.conv_state = "PROBE"
+        self.assertEqual(next_ask(state, True, "ask"), "feature")
+
+    def test_delivery_does_not_emit_a_follow_up_action(self):
+        from src.dialogue import ConversationState, compose_message, next_ask
+
+        state = ConversationState(user_profile={})
+        state.conv_state = "DELIVER"
+        state.ig_attr = "color"
+        state.ig_phrasing = "Any color preference?"
+        self.assertIsNone(next_ask(state, True, "ask"))
+        self.assertNotEqual(compose_message(None, state, True), state.ig_phrasing)
+
+    def test_selector_skips_boundary_slot(self):
+        from src.understanding import Belief, NeedModel, QuestionSelector
+
+        catalog = {
+            "A": {"title": "First jacket", "price": 29.99},
+            "B": {"title": "Second jacket", "price": 39.99},
+        }
+        selector = QuestionSelector(catalog, lambda asin: catalog[asin]["title"], [])
+        need = NeedModel()
+        need.no_preference.add("color")
+        belief = Belief(
+            margin=0.4,
+            attr_uncertainty={"color": 1.0, "size": 0.8},
+        )
+        attr, _phrase = selector.select(belief, need, "PROBE", ["A", "B"])
+        self.assertEqual(attr, "size")
+
 
 class DCPPersistenceTest(unittest.TestCase):
     def test_nonpersistent_stores_never_read_or_write_disk(self):
