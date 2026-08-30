@@ -108,8 +108,11 @@ STRUCTURED_COVERAGE_WEIGHT: float = 0.0
 # where match = max(verbatim-lexical IDF fraction, SATISFACTION_SEM_ALPHA * semantic cosine). Coverage
 # is the special case that uses only the lexical term; adding the semantic term makes the score
 # survive paraphrase (the reworded phrase matches the product's real vocabulary by meaning). Replaces
-# the coverage re-sort when on. Off by default until it beats coverage on eval_matrix (pop-ablated).
-USE_SATISFACTION_RANKER: bool = False
+# the coverage re-sort when on. ON by default: validated (scripts/validate_satisfaction.py) to lift
+# the honest sets — pillar_free 0.295 -> 0.398 (+35%), pillar_moderate 0.483 -> 0.501 — while public
+# holds at 0.903 (a deliberate -0.014 leaderboard cost for large paraphrase robustness). Set False to
+# revert to the pure-coverage ranker (public 0.9172).
+USE_SATISFACTION_RANKER: bool = True
 # Weight on the semantic-cosine term relative to the verbatim-lexical term. 1.0 = a paraphrase match
 # (cosine ~0.5) competes with a partial verbatim match; 0 = pure lexical (reproduces coverage).
 SATISFACTION_SEM_ALPHA: float = 1.0
@@ -118,7 +121,7 @@ SATISFACTION_SEM_ALPHA: float = 1.0
 # So blend popularity as a prior weighted w_pop = SATISFACTION_POP_WEIGHT * (1 - specificity), where
 # specificity rises with how much discriminating signal the shopper disclosed: fame breaks ties when
 # the turn is vague, and fades to ~0 once the need is specific (so the long-tail target is not buried).
-SATISFACTION_POP_WEIGHT: float = 0.3
+SATISFACTION_POP_WEIGHT: float = 0.15   # validated sweet spot (holds public, lifts honest sets)
 # Number of disclosed constraint phrases at which specificity saturates to 1 (popularity -> 0).
 SATISFACTION_SPECIFICITY_REF: int = 3
 

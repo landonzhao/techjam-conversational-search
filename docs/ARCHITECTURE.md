@@ -251,7 +251,7 @@ the ~0.93 public score. It supports several measured, configurable refinements:
 
 The returned score dict is always *raw* coverage, so the belief model sees true constraint coverage.
 
-### 8.3 NeedSatisfactionScorer (the rebuild — flag `USE_SATISFACTION_RANKER`, off by default)
+### 8.3 NeedSatisfactionScorer (the rebuild — flag `USE_SATISFACTION_RANKER`, ON by default)
 A generalization of coverage that scores each candidate by how well it *satisfies* the disclosed
 phrases:
 
@@ -267,9 +267,10 @@ survives paraphrase. No popularity re-sort — a well-satisfied but unpopular ta
 **Phase 2** adds *adaptive popularity* (`SATISFACTION_POP_WEIGHT`): a fame prior weighted
 `(1 − specificity)`, high when the shopper is vague, fading to ~0 as they get specific.
 
-Measured (leak-free / public, honest = pop-ablated view): satisfaction beats pure coverage on the
-honest set (0.810 vs 0.767, MRR 0.687 vs 0.549) while holding public best among the modified rankers
-(~0.90). It is off by default pending final validation. See RANKING_REDESIGN.md.
+Validated (`scripts/validate_satisfaction.py`, `SATISFACTION_POP_WEIGHT=0.15`) and now the **default
+ranker**: it lifts the honest sets (pillar_free 0.295 → 0.398 = +35%, pillar_moderate 0.483 → 0.501)
+while public holds at 0.903 — a deliberate −0.014 leaderboard cost for large paraphrase robustness.
+Set `USE_SATISFACTION_RANKER=False` to revert to pure coverage (public 0.9172). See RANKING_REDESIGN.md.
 
 ### 8.4 Diversifier
 Maximal-marginal-relevance reordering of the tail (browsing), protecting a confident head so the
@@ -355,9 +356,9 @@ Notable defaults (see comments in `config.py` for measured tradeoffs):
 |---|---|---|
 | `COVERAGE_RETRIEVAL_WEIGHT` | 1.0 | retrieval floor (proven robustness win) |
 | `COVERAGE_INFORMATIVE_MIN` | 0.0 | discrimination gate (off; experimental) |
-| `USE_SATISFACTION_RANKER` | False | the ranker rebuild (off; experimental) |
+| `USE_SATISFACTION_RANKER` | True | the ranker rebuild (default; validated) |
 | `SATISFACTION_SEM_ALPHA` | 1.0 | semantic-vs-lexical weight in satisfaction |
-| `SATISFACTION_POP_WEIGHT` | 0.3 | adaptive popularity prior (Phase 2) |
+| `SATISFACTION_POP_WEIGHT` | 0.15 | adaptive popularity prior (Phase 2) |
 | `POOL_SIZE` | — | retrieval pool size |
 
 ---
