@@ -129,7 +129,10 @@ class Agent:
     SEMANTIC_COVERAGE_GATE = SEMANTIC_COVERAGE_GATE
     USE_NEG_DOWNWEIGHT = False      # measured −0.027; off
     USE_CATEGORY_TIEBREAK = False   # measured −0.019; off
-    USE_CROSS_ENCODER = False       # measured neutral/negative; off
+    # ON: retrieve-then-rerank precision fix. Neutral on the leaky public set (coverage already wins
+    # there, -0.016), but a large win on honest/reworded input where the bi-encoder can't resolve the
+    # exact item among look-alikes: pillar_free 0.46 -> 0.66 (MRR 0.31 -> 0.59). Local, offline, $0.
+    USE_CROSS_ENCODER = True
     CE_DEPTH = CE_DEPTH
     CE_WEIGHT = CE_WEIGHT
     USE_LLM_RERANK = False          # Gemini reranker; off (rate-limited)

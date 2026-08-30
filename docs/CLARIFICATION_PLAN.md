@@ -47,3 +47,20 @@ first, to minimize MTTC.
 
 Primary: `pillar_free.jsonl` browsing slice (MTTC + hit). Guardrail: public (MTTC must not regress).
 Diagnostic: `pillar_moderate.jsonl`. All via the official evaluator's per-scenario metrics.
+
+## Debug conclusion — the probe is a dead end (this diagnosis was wrong)
+
+Tracing browsing sessions (`scripts/debug_browsing.py`) overturned the plan:
+
+- `INFO_GAIN_MODE="display"` (the default) makes `next_ask` ignore the selector's `ask_attribute`
+  entirely — it only changes message wording. And `ASK_PRIORITY` starts with `"other"`, so the agent
+  asks `"other"` every turn regardless, which unlocks any 2 undisclosed constraints per turn.
+- So clarification EXTRACTION already works: **constraints are disclosed in 87% of browsing sessions.**
+- The browsing failure is RANKING: in **40% of sessions the target is disclosed but never ranked into
+  the top 10** (only 7% are a reveal-timing issue).
+
+So attribute-selection (the feature-facet probe) cannot help — the bottleneck is ranking, not asking.
+The probe is left behind its off-by-default flag but is inert in display mode; it should be removed in
+a cleanup pass. **The real fix is precision reranking of the candidate set — the cross-encoder** (see
+ARCHITECTURE §8, `USE_CROSS_ENCODER`), which lifts the honest set pillar_free 0.46 → 0.66 (MRR
+0.31 → 0.59) by resolving the exact item among look-alikes once constraints are known.
