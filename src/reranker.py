@@ -1,4 +1,10 @@
-"""Phase 4 — conversation-aware LLM reranker (Gemini).
+"""Conversation-aware rerankers (local cross-encoder + Gemini LLM).
+
+═══ OPTIONAL LAYER — OFF by default, NOT on the critical scored path. ═══
+Both rerankers are disabled in scoring (USE_CROSS_ENCODER / USE_LLM_RERANK = False): the local
+cross-encoder measured neutral/negative, and the LLM reranker is rate-limited. They are wired,
+gated on near-ties, and token-metered so they can be enabled and measured — see the flag ledger in
+src/agent.py. This is the "LLM Semantic Ranking" pillar hook; keep only on a measured win.
 
 Reorders the retrieved candidate pool against the full conversation so the exact
 target rises toward rank 1. Provider-agnostic in spirit; this implementation uses
@@ -16,7 +22,7 @@ import re
 
 from src.keys import GeminiClientPool
 
-DEFAULT_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_MODEL = "gemini-flash-lite-latest"
 
 MATERIAL_RE = re.compile(
     r"\b(cotton|polyester|nylon|leather|wool|spandex|silk|rayon|fabric|alloy|"
@@ -85,8 +91,6 @@ class LLMReranker:
         self.catalog = catalog
         self.model = model
         self._pool = GeminiClientPool()
-        self.prompt_tokens = 0
-        self.completion_tokens = 0
 
     @property
     def available(self) -> bool:
@@ -134,10 +138,6 @@ class LLMReranker:
                 ),
             )
             order = self._parse_order(resp.text, len(head))
-            usage = getattr(resp, "usage_metadata", None)
-            if usage:
-                self.prompt_tokens += int(getattr(usage, "prompt_token_count", 0) or 0)
-                self.completion_tokens += int(getattr(usage, "candidates_token_count", 0) or 0)
         except Exception:
             return asins  # fail safe
         if not order:

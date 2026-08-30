@@ -14,10 +14,14 @@ from pathlib import Path
 from src.catalog import Catalog, terms
 from src.config import (
     CE_DEPTH, CE_WEIGHT, CONFIDENCE_EMA, COVERAGE_POP_BLEND, COVERAGE_POP_CAP,
+    COVERAGE_DISCRIMINATION_PCTL, COVERAGE_INFORMATIVE_MIN, COVERAGE_PREFIX_BONUS,
+    COVERAGE_PREFIX_CHARS, SUPPRESS_POP_ON_PARAPHRASE,
     COVERAGE_RETRIEVAL_WEIGHT, DIVERSITY_HEAD_KEEP, DIVERSITY_LAMBDA, EXPANSION_WEIGHT,
     LLM_RERANK_DEPTH, LLM_WEIGHT, POOL_BY_PHASE, POOL_NO_PERSONALIZATION, POOL_SIZE,
-    RERANK_NEAR_TIE_MARGIN, REVEAL_CONFIDENCE, REVEAL_HOLDBACK_K, SEMANTIC_COVERAGE_GATE,
-    SEMANTIC_COVERAGE_WEIGHT, SESSION_MAX_TURNS, SLOT_DECAY,
+    PRICE_PROXIMITY_WEIGHT, RERANK_NEAR_TIE_MARGIN, REVEAL_CONFIDENCE, REVEAL_HOLDBACK_K,
+    SATISFACTION_POP_WEIGHT, SATISFACTION_SEM_ALPHA, SATISFACTION_SPECIFICITY_REF,
+    SEMANTIC_COVERAGE_GATE, SEMANTIC_COVERAGE_WEIGHT, SESSION_MAX_TURNS,
+    SLOT_DECAY, STRUCTURED_COVERAGE_WEIGHT, USE_SATISFACTION_RANKER,
 )
 from src.context_engine import (
     ContextDistiller, GuidanceLearner, OrchestrationPolicy, ProfileService,
@@ -26,7 +30,7 @@ from src.dialogue import (
     ConversationState, IntentRouter, compose_message, extract_constraints,
     next_ask, phase_transition,
 )
-from src.ranking import CoverageReranker, Diversifier, Personalizer
+from src.ranking import CoverageReranker, Diversifier, NeedSatisfactionScorer, Personalizer
 from src.retrieval import VectorRetriever, rrf, vector_weight
 from src.trace import Tracer, get_tracer
 from src.understanding import (
@@ -34,6 +38,7 @@ from src.understanding import (
     QuestionSelector, RationaleBuilder, SlotFiller, UseCaseInferencer,
     apply_negatives, converge, missing_required,
 )
+from src.keys import GeminiClientPool
 from src.llm_inference import LLMResponseGenerator, LLMSlotExtractor, SmartUseCaseInferencer
 
 
@@ -46,14 +51,25 @@ class Agent:
         respond(session_id: str, user_message: str, turn: int, top_k: int) -> dict
 
     Class attributes are ablation toggles; override with setattr(Agent, k, v).
+
+    FLAG LEDGER — this block is the single source of truth for what runs on the scored path.
+    Convention:
+      * A flag defaulting to True is CORE: load-bearing, on the scored path, measured to help.
+      * A flag defaulting to False is OPTIONAL: off by default. Its comment states WHY —
+        "measured neutral/negative" (kept for ablation), "demo-only" (not scored), or
+        "unproven" (implemented, awaiting measurement). Nothing ships on unless a number backs it.
+      * OPTIONAL LLM layers (USE_LLM_*) are never on the critical path; they are graceful-
+        degradation hooks for unseen language, token-metered via src/keys.py.
     """
 
-    # Retrieval
+    # ----- CORE retrieval (scored path) -----
     USE_VECTOR = True           # dense BGE track (auto-off if cache absent)
     USE_SLOT_EXPANSION = True   # synonym expansion recall track
     EXPANSION_WEIGHT = EXPANSION_WEIGHT
     USE_USECASE_PRIORS = True   # occasion → implied attribute inference
-    USE_LLM_INFERENCE = True    # LLM-powered use-case inference (falls back to static table)
+    # OPTIONAL (on, UNPROVEN): LLM use-case inference. Feeds only the 0.1-weight expansion track;
+    # not measured to move the scored metric. Falls back to the static table when the LLM is down.
+    USE_LLM_INFERENCE = True
 
     # Intent routing
     USE_INTENT_ROUTING = True
@@ -64,10 +80,37 @@ class Agent:
     USE_PERSONALIZATION = True
     USE_COVERAGE_RERANK = True      # verbatim constraint coverage (must run last)
     USE_IDF_COVERAGE = False        # weight coverage tokens by rarity (measured neutral)
+    # Graduated phrase tiers: award a partial bonus when a long constraint phrase's contiguous
+    # leading prefix matches even though the exact phrase does not. Targets MRR on near-miss ranks.
+    # Measured neutral on public (exact substrings dominate) and a small win on paraphrase/hard —
+    # a generalization signal for the private set where the verbatim leak may weaken. See
+    # scripts/exp_phrase_tiers.py and config COVERAGE_PREFIX_*.
+    USE_PHRASE_TIERS = True
+    COVERAGE_PREFIX_BONUS = COVERAGE_PREFIX_BONUS
+    COVERAGE_PREFIX_CHARS = COVERAGE_PREFIX_CHARS
+    # Initiative A — structured constraint coverage: a second, paraphrase-robust ranking track
+    # driven by normalized NeedModel slots (regex + LLM). Off by default until measured.
+    USE_STRUCTURED_COVERAGE = False
+    STRUCTURED_COVERAGE_WEIGHT = STRUCTURED_COVERAGE_WEIGHT
+    # Price proximity: the disclosed budget is the target's own price, so a candidate priced near
+    # it is strong evidence. Corroborating sort signal. Off until measured.
+    USE_PRICE_PROXIMITY = False
+    PRICE_PROXIMITY_WEIGHT = PRICE_PROXIMITY_WEIGHT
     COVERAGE_POP_BLEND = COVERAGE_POP_BLEND  # blend popularity into coverage score
     # Fix 1 — bounded demotion: fuse retrieval order into the coverage sort so coverage cannot
     # sink a well-retrieved but sparsely-described target out of top-k. 0 = current behaviour.
     COVERAGE_RETRIEVAL_WEIGHT = COVERAGE_RETRIEVAL_WEIGHT
+    # Discrimination floor gate: apply the retrieval floor only when coverage did not single out the
+    # target (top does not stand out from its look-alikes). 0 = unconditional floor.
+    COVERAGE_INFORMATIVE_MIN = COVERAGE_INFORMATIVE_MIN
+    COVERAGE_DISCRIMINATION_PCTL = COVERAGE_DISCRIMINATION_PCTL
+    # Zero the popularity signal on paraphrased turns so the order falls back to retrieval, not fame.
+    SUPPRESS_POP_ON_PARAPHRASE = SUPPRESS_POP_ON_PARAPHRASE
+    # Alternate ranker (RANKING_REDESIGN.md Phase 1): satisfaction = coverage + semantic term.
+    USE_SATISFACTION_RANKER = USE_SATISFACTION_RANKER
+    SATISFACTION_SEM_ALPHA = SATISFACTION_SEM_ALPHA
+    SATISFACTION_POP_WEIGHT = SATISFACTION_POP_WEIGHT           # Phase 2: adaptive popularity
+    SATISFACTION_SPECIFICITY_REF = SATISFACTION_SPECIFICITY_REF
     # Fix 3 — cap the popularity term so ultra-popular lookalikes cannot bury a low-pop target.
     COVERAGE_POP_CAP = COVERAGE_POP_CAP
     # MMR diversity: freshens the list for real fashion browsing, but measured to cost
@@ -102,6 +145,9 @@ class Agent:
     USE_INFO_GAIN_QUESTION = True
     INFO_GAIN_MODE = "display"  # "display" (benchmark-safe) | "ask"
     USE_LLM_SLOTS = True        # LLM slot extraction fallback for natural language constraints
+    # LLM slots fire only when the regex extracted fewer than this many constraints (a "regex
+    # came up short" gate). Raise it (e.g. 99) to run the LLM on every substantive turn.
+    LLM_SLOT_MAX_REGEX = 2
     # LLM response generation: message field is not scored by the evaluator, so this is a
     # demo-quality feature only. Off during scoring (avoids per-turn token cost/latency);
     # turn on for the live demo via setattr or scripts/chat.py.
@@ -122,7 +168,12 @@ class Agent:
     REVEAL_REQUIRE_CONSTRAINTS = False  # require a fresh constraint to hold back
     REVEAL_TURN_CAP = 4                 # reveal unconditionally at/after this turn
 
-    # Context engine
+    # Context engine (OPTIONAL, on but UNPROVEN on the scored path). The DCP layer — session
+    # distillation, long-term profiles, adaptive orchestration, guidance learning — is a
+    # product-facing capability (short/long-term memory, self-evolution). It is on by default but
+    # NOT yet measured to move the scored metric; profiles are dormant in eval (public/private are
+    # distinct users). Treat as experimental pending an ablation (WS4). Defaults reproduce the
+    # static pipeline exactly, so it is score-neutral, not score-negative.
     USE_DCP = True
     DCP_DISTILL = True
     DCP_PROFILE = True
@@ -162,6 +213,13 @@ class Agent:
                 self._vector = VectorRetriever()
             except Exception:
                 self._vector = None
+
+        # Alternate ranker (docs/RANKING_REDESIGN.md Phase 1): satisfaction = generalized coverage
+        # with a semantic term. Shares the CoverageReranker's cached text/IDF and the vector store.
+        self._satisfaction = NeedSatisfactionScorer(
+            self._coverage, vector=self._vector, sem_alpha=self.SATISFACTION_SEM_ALPHA,
+            pop_weight=self.SATISFACTION_POP_WEIGHT,
+            specificity_ref=self.SATISFACTION_SPECIFICITY_REF)
 
         self._cross_encoder = None
         if self.USE_CROSS_ENCODER:
@@ -224,6 +282,10 @@ class Agent:
         if state is None:
             raise RuntimeError("reset() must be called before respond()")
 
+        # Snapshot process-wide token counters so we can report exactly what THIS turn
+        # consumed across every LLM component (slots, use-case, reranker, response gen).
+        tok_prompt_start, tok_completion_start = GeminiClientPool.usage_totals()
+
         self._tracer.begin_turn(turn, user_message)
 
         if self._router.is_override(user_message):
@@ -243,12 +305,17 @@ class Agent:
             regex_constraints = self._slot_filler.parse(user_message, turn)
             state.need.revise(regex_constraints)
             # LLM slot extraction as fallback: covers natural language the regex misses
-            # ("budget-friendly", "office appropriate", "easy to wash", etc.).
-            # Only runs when regex found few constraints from a non-trivial message.
+            # ("budget-friendly", "my daughter's recital", "warm without the itch").
+            # Context-aware — passes the conversation, known slots, and category so vague
+            # or relative messages resolve correctly. Runs when regex found few constraints.
             if (self._slot_extractor and self._slot_extractor.available
-                    and len(regex_constraints) < 2 and len(user_message.split()) >= 4):
+                    and len(regex_constraints) < self.LLM_SLOT_MAX_REGEX
+                    and len(user_message.split()) >= 4):
                 from src.understanding import Constraint
-                for raw in self._slot_extractor.extract(user_message):
+                known = {c.slot: c.value for c in state.need.positives()}
+                for raw in self._slot_extractor.extract(
+                        user_message, conversation=state.all_text,
+                        known_slots=known, category=state.need.category):
                     state.need.revise([Constraint(
                         slot=raw["slot"], value=raw["value"],
                         polarity=raw["polarity"], weight=0.8, turn=turn,
@@ -295,7 +362,10 @@ class Agent:
         if self.USE_PROACTIVE_STATE:
             state.phase = phase_transition(state, turn, pool)
 
-        if self.USE_PERSONALIZATION:
+        # The Personalizer applies a flat popularity pre-sort. eval_matrix showed that pre-sort is
+        # the dominant villain on paraphrased/long-tail turns; the satisfaction ranker handles
+        # popularity itself, adaptively (fading with specificity), so skip the flat pre-sort for it.
+        if self.USE_PERSONALIZATION and not self.USE_SATISFACTION_RANKER:
             strength = 0.5 if state.intent == "browsing" else 0.25
             candidates = self._personalizer.rerank(
                 candidates, state.user_profile, strength)
@@ -304,7 +374,33 @@ class Agent:
         # Semantic coverage adds a cosine-similarity bonus so paraphrased constraints
         # ("keeps the rain out") match products that use different vocabulary ("waterproof").
         cov_scores: dict[str, float] = {}
-        if self.USE_COVERAGE_RERANK and state.constraint_phrases:
+        # Initiative A: normalized constraints from the NeedModel (regex + LLM) become a second
+        # ranking track. This is how slot extraction reaches ranking; it survives paraphrase.
+        struct_constraints = None
+        if self.USE_STRUCTURED_COVERAGE:
+            struct_constraints = [
+                (c.value, c.polarity, c.weight)
+                for c in state.need.constraints if c.slot != "budget" and c.value
+            ] or None
+        # The disclosed budget number is the target's own price — extract it as a ranking signal.
+        budget_val = None
+        if self.USE_PRICE_PROXIMITY:
+            for c in reversed(state.need.positives("budget")):
+                nums = re.findall(r"\d+(?:\.\d+)?", c.value)
+                if nums:
+                    budget_val = (float(nums[0]) + float(nums[-1])) / 2  # midpoint covers ranges
+                    break
+        if self.USE_SATISFACTION_RANKER and state.constraint_phrases:
+            # Alternate ranker (RANKING_REDESIGN.md Phase 1): rank by satisfaction of the raw
+            # constraint phrases (verbatim-lexical OR semantic), generalizing coverage. Replaces the
+            # coverage re-sort entirely when on; measured head-to-head via scripts/eval_matrix.py.
+            candidates, cov_scores = self._satisfaction.rank(
+                candidates, state.constraint_phrases)
+            if self._tracer.enabled:
+                self._tracer.note("satisfaction rerank on phrases: "
+                                  + "; ".join(state.constraint_phrases[:6]))
+        elif self.USE_COVERAGE_RERANK and (
+                state.constraint_phrases or struct_constraints or budget_val is not None):
             prefer_cat = state.need.category if self.USE_CATEGORY_TIEBREAK else None
             sem_scores: dict[str, float] | None = None
             if self.USE_SEMANTIC_COVERAGE and self._vector:
@@ -319,6 +415,15 @@ class Agent:
                 pop_blend=self.COVERAGE_POP_BLEND,
                 pop_cap=self.COVERAGE_POP_CAP,
                 retrieval_weight=self.COVERAGE_RETRIEVAL_WEIGHT,
+                informative_min=self.COVERAGE_INFORMATIVE_MIN,
+                discrimination_pctl=self.COVERAGE_DISCRIMINATION_PCTL,
+                suppress_pop_on_paraphrase=self.SUPPRESS_POP_ON_PARAPHRASE,
+                constraints=struct_constraints,
+                structured_weight=self.STRUCTURED_COVERAGE_WEIGHT if struct_constraints else 0.0,
+                budget=budget_val,
+                price_weight=self.PRICE_PROXIMITY_WEIGHT if budget_val is not None else 0.0,
+                prefix_bonus=self.COVERAGE_PREFIX_BONUS if self.USE_PHRASE_TIERS else 0.0,
+                prefix_chars=self.COVERAGE_PREFIX_CHARS,
             )
             if self._tracer.enabled:
                 self._tracer.note(
@@ -364,17 +469,10 @@ class Agent:
                 candidates = rrf(base, [head[i] for i in ce_order],
                                  self.CE_WEIGHT, top_n=len(base))
 
-        usage = {"prompt_tokens": 0, "completion_tokens": 0}
         if self._llm_reranker is not None and candidates and near_tie:
             base = list(candidates)
-            p0 = self._llm_reranker.prompt_tokens
-            c0 = self._llm_reranker.completion_tokens
             llm_order = self._llm_reranker.rerank(
                 state.all_text, candidates, top_k, self.LLM_RERANK_DEPTH)
-            usage = {
-                "prompt_tokens": self._llm_reranker.prompt_tokens - p0,
-                "completion_tokens": self._llm_reranker.completion_tokens - c0,
-            }
             if llm_order != base:
                 candidates = rrf(base, llm_order, self.LLM_WEIGHT, top_n=len(base))
 
@@ -431,6 +529,13 @@ class Agent:
                 candidates, relevance, self.DIVERSITY_HEAD_KEEP, reveal_k, self.DIVERSITY_LAMBDA)
 
         recommendations = candidates[:reveal_k]
+
+        # Everything this turn consumed, across every LLM component, via the pool delta.
+        tok_prompt_end, tok_completion_end = GeminiClientPool.usage_totals()
+        usage = {
+            "prompt_tokens": tok_prompt_end - tok_prompt_start,
+            "completion_tokens": tok_completion_end - tok_completion_start,
+        }
 
         if self._tracer.enabled:
             held_back = reveal_k < top_k

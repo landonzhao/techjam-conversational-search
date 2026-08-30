@@ -264,5 +264,88 @@ class AgentSmokeTest(unittest.TestCase):
         self.assertEqual(st.constraint_phrases, [])
 
 
+# ---------------------------------------------------------------------------
+# src/ranking.py — discrimination floor gate (conditional retrieval floor)
+class DiscriminationGateTest(unittest.TestCase):
+    def _cov(self):
+        from src.ranking import CoverageReranker
+        cat = {
+            "T":  {"title": "zephyr corduroy jacket", "features": "napped pile warm",
+                   "rating_number": 10},
+            "B1": {"title": "acme corduroy jacket", "features": "plain", "rating_number": 9000},
+            "B2": {"title": "acme corduroy coat", "features": "plain", "rating_number": 9000},
+            "X":  {"title": "unrelated sandal", "features": "beach", "rating_number": 5},
+        }
+        return CoverageReranker(cat)
+
+    def test_discriminating_phrase_floor_off_target_leads(self):
+        # A word only the target carries -> gate says informative -> floor OFF -> coverage wins.
+        order, _ = self._cov().rerank_scored(
+            ["B1", "B2", "T", "X"], ["zephyr", "napped pile"], retrieval_weight=2.0,
+            informative_min=0.5, discrimination_pctl=0.9,
+            suppress_pop_on_paraphrase=True, pop_blend=0.1)
+        self.assertEqual(order[0], "T")
+
+    def test_shared_anchor_floor_on_target_not_buried(self):
+        # A word many rivals share -> gate says uninformative -> floor ON + pop suppressed ->
+        # retrieval order preserved, so the target is not sunk under the 9000-rating brand-mates.
+        order, _ = self._cov().rerank_scored(
+            ["B1", "B2", "T", "X"], ["corduroy"], retrieval_weight=2.0,
+            informative_min=0.5, discrimination_pctl=0.9,
+            suppress_pop_on_paraphrase=True, pop_blend=0.1)
+        self.assertLessEqual(order.index("T"), 2)
+
+    def test_gate_off_is_unconditional_floor(self):
+        # informative_min=0 -> legacy behaviour, no crash, order is a permutation of the input.
+        order, _ = self._cov().rerank_scored(
+            ["B1", "B2", "T", "X"], ["corduroy"], retrieval_weight=2.0, informative_min=0.0)
+        self.assertEqual(set(order), {"B1", "B2", "T", "X"})
+
+
+# ---------------------------------------------------------------------------
+# src/ranking.py — NeedSatisfactionScorer (generalized coverage)
+class SatisfactionScorerTest(unittest.TestCase):
+    def _make(self, vector=None, sem_alpha=1.0):
+        from src.ranking import CoverageReranker, NeedSatisfactionScorer
+        cat = {
+            "T": {"title": "corduroy jacket", "features": "napped pile warm"},
+            "P": {"title": "plain cotton tee", "features": "basic"},
+            "Q": {"title": "leather belt", "features": "buckle"},
+        }
+        return NeedSatisfactionScorer(CoverageReranker(cat), vector=vector, sem_alpha=sem_alpha)
+
+    def test_lexical_match_ranks_target_first(self):
+        # No vector -> pure lexical. Only T contains "corduroy" -> T leads.
+        order, sat = self._make().rank(["P", "Q", "T"], ["corduroy jacket"])
+        self.assertEqual(order[0], "T")
+        self.assertGreater(sat["T"], sat["P"])
+
+    def test_empty_phrases_preserve_order(self):
+        order, _ = self._make().rank(["P", "Q", "T"], [])
+        self.assertEqual(order, ["P", "Q", "T"])
+
+    def test_semantic_rescues_paraphrase_without_lexical_overlap(self):
+        # A phrase with NO lexical overlap + a stub vector that only T is similar to -> the
+        # semantic term must lift T above the lexically-tied rivals.
+        class StubVector:
+            def phrase_similarity_matrix(self, phrases, asins):
+                return {"T": [0.9], "P": [0.1], "Q": [0.05]}
+        order, sat = self._make(vector=StubVector()).rank(
+            ["P", "Q", "T"], ["ribbed velvety fabric"])
+        self.assertEqual(order[0], "T")
+        self.assertGreater(sat["T"], sat["P"])
+
+    def test_sem_alpha_zero_ignores_semantic(self):
+        # sem_alpha=0 disables the semantic term -> a stub vector cannot change the order; with no
+        # lexical overlap all scores are 0 and the input order is preserved (== coverage behaviour).
+        class StubVector:
+            def phrase_similarity_matrix(self, phrases, asins):
+                return {a: [0.9] for a in asins}
+        order, sat = self._make(vector=StubVector(), sem_alpha=0.0).rank(
+            ["P", "Q", "T"], ["ribbed velvety fabric"])
+        self.assertEqual(order, ["P", "Q", "T"])
+        self.assertEqual(max(sat.values()), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,12 @@
 """Context engine: session distillation, user profiles, orchestration policy, guidance learning.
 
+═══ OPTIONAL LAYER — on by default but UNPROVEN on the scored path. ═══
+This is the Dynamic Context Programming (self-evolution / short + long-term memory) capability. Its
+defaults reproduce the static pipeline exactly, so it is score-NEUTRAL, not negative; long-term
+profiles are dormant in evaluation because public/private sessions are distinct users. It is a
+product-facing capability pending an ablation (WS4) to show it moves the metric. See src/agent.py
+flag ledger (USE_DCP family).
+
 Four components:
   ContextDistiller    — recency decay, volatility tracking, salience pruning per turn
   ProfileService      — persistent per-user preferences with time-decay
@@ -124,7 +131,6 @@ class UserProfile:
     user_id: str
     prefs: list[ProfilePreference] = field(default_factory=list)
     category_affinity: dict[str, float] = field(default_factory=dict)
-    price_band: tuple[float, float] | None = None
     guidance_bias: dict[str, float] = field(default_factory=dict)
     schema_v: int = 1
 
@@ -137,18 +143,15 @@ class UserProfile:
             "user_id": self.user_id, "schema_v": self.schema_v,
             "prefs": [p.as_dict() for p in self.prefs],
             "category_affinity": {k: round(v, 4) for k, v in self.category_affinity.items()},
-            "price_band": list(self.price_band) if self.price_band else None,
             "guidance_bias": {k: round(v, 4) for k, v in self.guidance_bias.items()},
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "UserProfile":
-        pb = d.get("price_band")
         return cls(
             user_id=d.get("user_id", ""),
             prefs=[ProfilePreference(**p) for p in d.get("prefs", [])],
             category_affinity=dict(d.get("category_affinity", {})),
-            price_band=tuple(pb) if pb else None,
             guidance_bias=dict(d.get("guidance_bias", {})),
             schema_v=d.get("schema_v", 1),
         )

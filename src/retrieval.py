@@ -114,6 +114,27 @@ class VectorRetriever:
             result[asin] = float((vecs @ self.embeddings[idx]).max()) if idx is not None else 0.0
         return result
 
+    def phrase_similarity_matrix(self, phrases: list[str],
+                                 asins: list[str]) -> dict[str, list[float]]:
+        """Per-phrase cosine similarity to each candidate (NOT max-reduced over phrases).
+
+        Returns {asin: [cos(phrase_0, asin), cos(phrase_1, asin), ...]}. Unlike
+        `phrase_similarities` (which max-reduces for a single coverage bonus), the satisfaction
+        scorer needs each phrase's similarity separately so it can weight and gate per constraint.
+        Cheap: one encode of the few phrases, then a cached-embedding dot product per candidate.
+        """
+        if not phrases or not asins:
+            return {}
+        vecs = self.model.encode(
+            [EMBED_QUERY_PREFIX + p for p in phrases], normalize_embeddings=True
+        ).astype("float32")  # (P, D)
+        zeros = [0.0] * len(phrases)
+        result: dict[str, list[float]] = {}
+        for asin in asins:
+            idx = self._asin_index.get(asin)
+            result[asin] = (self.embeddings[idx] @ vecs.T).tolist() if idx is not None else list(zeros)
+        return result
+
     def _top(self, vec, top_n: int) -> list[str]:
         scores = self.embeddings @ vec
         n = min(top_n, len(scores))

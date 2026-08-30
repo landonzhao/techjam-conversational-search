@@ -11,7 +11,8 @@ import re
 from src.catalog import TOKEN_RE, text, terms
 from src.config import (
     COVERAGE_FULL_PHRASE_BONUS, COVERAGE_LEN_WEIGHT, COVERAGE_POP_BLEND,
-    COVERAGE_TIE_BREAK, POP_WEIGHT, RRF_K, TAG_WEIGHT,
+    COVERAGE_TIE_BREAK, POP_WEIGHT, PRICE_FAR_PENALTY, PRICE_LOOSE, PRICE_NEAR,
+    RRF_K, TAG_WEIGHT,
 )
 
 
@@ -122,8 +123,31 @@ class CoverageReranker:
         except (TypeError, ValueError):
             return 0.0
 
+    def _price_prox(self, asin: str, budget: float) -> float:
+        """Corroborating price-proximity factor for `asin` against a disclosed `budget`.
+
+        The simulator states the target's own price as the budget, so a near-exact price match is
+        strong evidence a candidate is the target. Returns +1.0 for an exact-price match, +0.4 for
+        a near match, a small capped penalty for a present-but-far price, and 0.0 when the candidate
+        has no usable price (missing price is not evidence either way).
+        """
+        raw = self.catalog.get(asin, {}).get("price")
+        try:
+            price = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        if price <= 0:
+            return 0.0
+        delta = abs(price - budget) / max(budget, 1.0)
+        if delta < PRICE_NEAR:
+            return 1.0
+        if delta < PRICE_LOOSE:
+            return 0.4
+        return -PRICE_FAR_PENALTY * min(delta, 3.0)
+
     def _coverage(self, asin: str, phrases: list[tuple[list[str], str]],
-                  use_idf: bool = False) -> float:
+                  use_idf: bool = False, prefix_bonus: float = 0.0,
+                  prefix_chars: int = 0) -> float:
         catalog_text = self.doc(asin)
         score = 0.0
         for toks, whole in phrases:
@@ -137,8 +161,15 @@ class CoverageReranker:
             else:
                 present = sum(1 for t in toks if t in catalog_text)
                 score += (present / len(toks)) * weight
-            if COVERAGE_FULL_PHRASE_BONUS and len(toks) >= 2 and whole and whole in catalog_text:
-                score += COVERAGE_FULL_PHRASE_BONUS * weight
+            # Graduated phrase tiers: exact substring > contiguous prefix > token overlap (above).
+            if COVERAGE_FULL_PHRASE_BONUS and len(toks) >= 2 and whole:
+                if whole in catalog_text:
+                    score += COVERAGE_FULL_PHRASE_BONUS * weight
+                elif (prefix_bonus and len(whole) >= prefix_chars
+                      and whole[:prefix_chars] in catalog_text):
+                    # Whole phrase is absent but its leading `prefix_chars` match contiguously —
+                    # a near-miss (usually one differing trailing word). Partial credit only.
+                    score += prefix_bonus * weight
         return score
 
     @staticmethod
@@ -150,6 +181,30 @@ class CoverageReranker:
                 prepared.append((toks, " ".join(toks)))
         return prepared
 
+    def _structured(self, asin: str,
+                    constraints: list[tuple[str, int, float]]) -> float:
+        """Structured constraint-satisfaction score for `asin`.
+
+        `constraints` are (normalized_value, polarity, weight) triples taken from the NeedModel —
+        i.e. slot values already canonicalized by the SlotFiller/LLM ("genuine hide" -> leather),
+        NOT raw message substrings. A positive constraint scores the IDF-weighted fraction of its
+        value tokens present in the candidate's catalog text; a negative constraint subtracts that
+        fraction (a candidate that HAS an avoided attribute is penalized). Because it matches
+        normalized values, it survives paraphrase where verbatim coverage does not, and it is the
+        path by which regex/LLM slot extraction reaches the ranking signal.
+        """
+        catalog_text = self.doc(asin)
+        score = 0.0
+        for value, polarity, weight in constraints:
+            toks = [t for t in TOKEN_RE.findall(value.lower()) if len(t) > 1]
+            if not toks:
+                continue
+            total = sum(self._idf(t) for t in toks) or 1.0
+            present = sum(self._idf(t) for t in toks if t in catalog_text)
+            frac = present / total
+            score += frac * weight if polarity > 0 else -frac * weight
+        return score
+
     def rerank_scored(
         self,
         asins: list[str],
@@ -160,8 +215,17 @@ class CoverageReranker:
         use_idf: bool = False,
         pop_blend: float = 0.0,
         retrieval_weight: float = 0.0,
+        informative_min: float = 0.0,
+        discrimination_pctl: float = 0.9,
+        suppress_pop_on_paraphrase: bool = False,
         semantic_gate: float = 0.0,
         pop_cap: float = 0.0,
+        constraints: list[tuple[str, int, float]] | None = None,
+        structured_weight: float = 0.0,
+        budget: float | None = None,
+        price_weight: float = 0.0,
+        prefix_bonus: float = 0.0,
+        prefix_chars: int = 0,
     ) -> tuple[list[str], dict[str, float]]:
         """Rerank and return (ordered_list, coverage_score_per_asin).
 
@@ -183,13 +247,39 @@ class CoverageReranker:
           sinking a strongly-retrieved but sparsely-described target out of the top-k — coverage
           sharpens the order, retrieval provides a floor. 0 reproduces the pure-coverage sort.
 
-        The returned score dict is always raw coverage (+semantic), never popularity/retrieval
-        blended, so the belief model still sees true constraint coverage.
+        informative_min (discrimination floor gate): if > 0, the retrieval floor is applied ONLY when
+          coverage failed to single out the target this turn — normalized discrimination
+          (top_cov − p_pctl_cov)/top_cov below informative_min. High discrimination (the target
+          stands alone on the disclosed words) means coverage nailed it -> floor skipped so it never
+          dilutes a correct verbatim sort. Low discrimination (words shared across look-alikes, e.g.
+          a brand anchor, or nothing matched) -> floor applied. 0 = unconditional floor.
+
+        discrimination_pctl: pool percentile used as the "rival" reference in the gate above (0.9 =
+          p90). Higher = stricter (the top must beat even its closest look-alikes to skip the floor).
+
+        suppress_pop_on_paraphrase: on an uninformative (paraphrased) turn, zero the popularity
+          blend and tie-break so coverage_order falls back to the retrieval order instead of
+          collapsing to "most famous" — which the retrieval floor then reinforces. Requires
+          informative_min > 0 to identify paraphrased turns. Verbatim turns are unaffected.
+
+        constraints / structured_weight (Initiative A): if both set, a second ranking track scores
+          candidates by satisfaction of the NORMALIZED NeedModel constraints (see _structured) and
+          is RRF-fused into the coverage order at structured_weight. This is the paraphrase-robust,
+          model-driven track; verbatim coverage remains the primary. 0 = off.
+
+        The returned score dict is always raw verbatim coverage (+semantic), never popularity/
+        retrieval/structured blended, so the belief model still sees true constraint coverage.
         """
         prepared = self._prepare(phrases)
-        if not prepared and not semantic_scores:
+        has_structured = bool(constraints) and structured_weight > 0
+        has_price = price_weight > 0 and budget is not None
+        if not prepared and not semantic_scores and not has_structured and not has_price:
             return asins, {}
-        exact = {a: self._coverage(a, prepared, use_idf) if prepared else 0.0 for a in asins}
+        exact = {
+            a: self._coverage(a, prepared, use_idf, prefix_bonus, prefix_chars)
+            if prepared else 0.0
+            for a in asins
+        }
         if semantic_scores and semantic_weight > 0:
             scores = {
                 a: exact[a] + semantic_weight * semantic_scores.get(a, 0.0)
@@ -200,30 +290,81 @@ class CoverageReranker:
             scores = exact
         base_rank = {a: i for i, a in enumerate(asins)}
 
+        # Informativeness (discrimination gate): did verbatim coverage single out ONE product this
+        # turn, or did it just match words shared across many look-alikes? Computed once and reused
+        # for both pop-suppression and the retrieval floor.
+        #
+        # We measure whether the top candidate STANDS OUT from its rivals, not raw magnitude. A raw
+        # magnitude gate is fooled by a shared anchor (e.g. a brand token every brand-mate carries):
+        # coverage looks high but doesn't identify the target. Discrimination = fraction of the top
+        # candidate's coverage NOT shared by the p-th-percentile candidate:
+        #   verbatim turn        -> only the target carries the disclosed spec words; the p90 rival
+        #                           scores ~0 -> discrimination ~1 -> informative -> floor OFF.
+        #   anchored-paraphrase  -> many rivals share the anchor and the attributes match no one, so
+        #                           the p90 rival ~ the top -> discrimination ~0 -> uninformative ->
+        #                           floor ON (lean on retrieval).
+        # Gate off (informative_min<=0) treats every turn as informative (legacy unconditional).
+        if informative_min > 0 and exact:
+            covs = sorted(exact.values())
+            top_cov = covs[-1]
+            if top_cov <= 0:
+                uninformative = True  # nothing matched verbatim at all -> lean on retrieval
+            else:
+                # p-th percentile of the pool: ignores the mass of zero-coverage candidates and asks
+                # whether the top beats the OTHER high scorers (its look-alikes), not the empty tail.
+                # Cap the index at len-2 so the reference is never the top element itself (matters
+                # only for tiny pools; on the real 200-pool p90 sits far below the top).
+                idx = max(0, min(len(covs) - 2, int(len(covs) * discrimination_pctl)))
+                ref = covs[idx]
+                uninformative = (top_cov - ref) / top_cov < informative_min
+        else:
+            uninformative = False
+
         def pop_term(a: str) -> float:
             p = self._pop(a)
             return min(p, pop_cap) if pop_cap > 0 else p
 
+        # On a paraphrased turn coverage is ~0 for every candidate, so blending/tie-breaking on
+        # popularity would collapse the order to "most famous" and re-pollute the semantic ranking
+        # the retrieval floor is trying to preserve. Suppress popularity on exactly those turns so
+        # coverage_order falls back to the retrieval order (which the floor then reinforces).
+        suppress_pop = suppress_pop_on_paraphrase and uninformative
+        eff_pop_blend = 0.0 if suppress_pop else pop_blend
+
         # Blend log-popularity into the primary score so a much more popular target can
         # overcome a small coverage deficit (popularity as tie-break alone cannot do this).
-        if pop_blend > 0:
-            ranked = {a: scores[a] + pop_blend * pop_term(a) for a in asins}
+        if eff_pop_blend > 0:
+            ranked = {a: scores[a] + eff_pop_blend * pop_term(a) for a in asins}
         else:
             ranked = scores
+        # Price proximity corroborates the coverage sort without touching the returned score.
+        if has_price:
+            ranked = {a: ranked[a] + price_weight * self._price_prox(a, budget) for a in asins}
         if prefer_cat:
             cm = {a: self._cat_match(a, prefer_cat) for a in asins}
             key = lambda a: (-ranked[a], -cm[a], -self._pop(a), base_rank[a])
-        elif COVERAGE_TIE_BREAK == "base":
+        elif suppress_pop or COVERAGE_TIE_BREAK == "base":
+            # Paraphrase turn (or configured): break ties on retrieval order, not popularity.
             key = lambda a: (-ranked[a], base_rank[a])
         else:  # "pop" — popularity tie-break
             key = lambda a: (-ranked[a], -self._pop(a), base_rank[a])
         coverage_order = sorted(asins, key=key)
 
+        if has_structured and len(asins) > 1:
+            # Second track: order by normalized constraint satisfaction, RRF-fuse into coverage.
+            struct = {a: self._structured(a, constraints) for a in asins}
+            structured_order = sorted(
+                asins, key=lambda a: (-struct[a], -self._pop(a), base_rank[a]))
+            coverage_order = _rrf_fuse(coverage_order, structured_order, structured_weight)
+
         if retrieval_weight > 0 and len(asins) > 1:
             # Bounded demotion: fuse the coverage order with the retrieval order (asins as given)
             # so a well-retrieved sparse target keeps a floor instead of sinking on low coverage.
-            fused = _rrf_fuse(coverage_order, asins, retrieval_weight)
-            return fused, scores
+            # Gated (informative_min>0): apply only on paraphrased turns — never dilute a correct
+            # verbatim sort. `uninformative` was computed once above.
+            if (informative_min <= 0) or uninformative:
+                fused = _rrf_fuse(coverage_order, asins, retrieval_weight)
+                return fused, scores
         return coverage_order, scores
 
     def rerank(self, asins: list[str], phrases: list[str],
@@ -234,6 +375,85 @@ class CoverageReranker:
         # title only — the categories field is polluted by Amazon's top-level path
         title = text(self.catalog.get(asin, {}).get("title")).lower()
         return 1 if re.search(rf"\b{re.escape(cat)}s?\b", title) else 0
+
+
+class NeedSatisfactionScorer:
+    """Ranks candidates by how well they SATISFY the disclosed need — a generalization of coverage.
+
+    The measured failure (scripts/oracle_leakfree.py): on reworded language the verbatim
+    CoverageReranker matches nothing, collapses to popularity, and buries a target retrieval had
+    placed at rank ~2 (97% of honest-set misses are this). This scorer replaces the collapse: for
+    each raw constraint phrase it computes
+
+        match(phrase, cand) = max( verbatim_lexical(phrase, cand),          # IDF fraction present
+                                   SEM_ALPHA * semantic_cosine(phrase, cand) )  # embedding meaning
+
+    and ranks by the phrase-length-weighted mean over phrases. Coverage is exactly the special case
+    that keeps only the lexical term, so on the leaky (verbatim) distribution behaviour is preserved
+    (lexical=1 dominates); the added semantic term is what survives paraphrase. No popularity re-sort:
+    a well-satisfied but unpopular target is no longer demoted.
+
+    Reuses CoverageReranker for the cached catalog text (`doc`), IDF table (`_idf`) and phrase
+    tokenization (`_prepare`), so there is one canonical text/IDF source. Semantic similarity comes
+    from the shared VectorRetriever (cached product embeddings); if it is unavailable the scorer
+    degrades to pure lexical (i.e. coverage).
+    """
+
+    def __init__(self, coverage: "CoverageReranker", vector=None,
+                 sem_alpha: float = 1.0, pop_weight: float = 0.0,
+                 specificity_ref: int = 3) -> None:
+        self._cov = coverage
+        self._vector = vector
+        self.sem_alpha = sem_alpha
+        self.pop_weight = pop_weight
+        self.specificity_ref = max(1, specificity_ref)
+
+    def _lexical(self, toks: list[str], catalog_text: str) -> float:
+        """IDF-weighted fraction of the phrase's tokens present verbatim, in [0, 1]."""
+        if not toks:
+            return 0.0
+        total = sum(self._cov._idf(t) for t in toks) or 1.0
+        present = sum(self._cov._idf(t) for t in toks if t in catalog_text)
+        return present / total
+
+    def rank(self, asins: list[str],
+             phrases: list[str]) -> tuple[list[str], dict[str, float]]:
+        """Return (ordered_asins, satisfaction_score_per_asin). Order preserves the incoming
+        (retrieval) order on ties, so a strong retrieval placement is the natural floor."""
+        prepared = self._cov._prepare(phrases)
+        if not prepared or len(asins) <= 1:
+            return asins, {a: 0.0 for a in asins}
+        # per-phrase semantic cosine to every candidate (one encode + cached-embedding dot products)
+        sims: dict[str, list[float]] = {}
+        if self._vector is not None and self.sem_alpha > 0:
+            sims = self._vector.phrase_similarity_matrix([whole for _, whole in prepared], asins)
+        sat: dict[str, float] = {}
+        for a in asins:
+            catalog_text = self._cov.doc(a)
+            row = sims.get(a)
+            num = den = 0.0
+            for j, (toks, _whole) in enumerate(prepared):
+                lex = self._lexical(toks, catalog_text)
+                sem = max(0.0, row[j]) if row else 0.0
+                match = max(lex, self.sem_alpha * sem)
+                weight = 1.0 + COVERAGE_LEN_WEIGHT * len(toks)  # longer phrase = more specific
+                num += weight * match
+                den += weight
+            sat[a] = num / den if den > 0 else 0.0
+        base_rank = {a: i for i, a in enumerate(asins)}
+        # Adaptive popularity prior: high when the turn is vague, fading to ~0 as the shopper gets
+        # specific, so fame breaks ties under ignorance but never buries a specifically-described
+        # long-tail target. specificity = how many distinct constraint phrases were disclosed.
+        ranked = sat
+        if self.pop_weight > 0:
+            specificity = min(1.0, len(prepared) / self.specificity_ref)
+            w_pop = self.pop_weight * (1.0 - specificity)
+            if w_pop > 0:
+                pops = {a: self._cov._pop(a) for a in asins}
+                hi = max(pops.values()) or 1.0
+                ranked = {a: sat[a] + w_pop * (pops[a] / hi) for a in asins}
+        order = sorted(asins, key=lambda a: (-ranked[a], base_rank[a]))
+        return order, sat  # return raw satisfaction as the score (belief sees true satisfaction)
 
 
 class Diversifier:

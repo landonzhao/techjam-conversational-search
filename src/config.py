@@ -57,6 +57,17 @@ TAG_WEIGHT: float = 0.3   # profile tag overlap boost
 # CoverageReranker
 COVERAGE_LEN_WEIGHT: float = 0.15
 COVERAGE_FULL_PHRASE_BONUS: float = 1.0
+# Graduated phrase-bonus middle tier (ByteMe-style): between the coarse token-overlap floor and
+# the exact-substring bonus, award a partial bonus when a long phrase's *contiguous leading prefix*
+# appears verbatim. A single altered/inserted trailing word destroys the exact-substring match but
+# leaves a long prefix intact, so this degrades more gracefully and sharpens near-miss ranks (MRR).
+# Scaled below COVERAGE_FULL_PHRASE_BONUS so a prefix match can never outrank a true exact match.
+COVERAGE_PREFIX_BONUS: float = 0.5   # 0 = tier off (reproduces the two-tier behaviour)
+COVERAGE_PREFIX_CHARS: int = 25      # min chars of the normalized phrase's prefix that must match
+# Measured (scripts/exp_phrase_tiers.py, LLM off): public byte-identical (exact substrings already
+# resolve the leak, so the tier never differentiates there); paraphrase MRR 0.5965→0.5984 and hard
+# MRR 0.5563→0.5647 / hit@10 0.714→0.717 at 0.5 bonus / 25 chars. Small, generalization-only, no
+# regression — enabled by default via Agent.USE_PHRASE_TIERS.
 COVERAGE_TIE_BREAK: str = "pop"  # "pop" (popularity) or "base" (incoming order)
 # Blend log-popularity INTO the coverage score (not just as a tie-break) so a much more
 # popular correct target can overcome a small coverage deficit against obscure lookalikes.
@@ -76,10 +87,72 @@ SEMANTIC_COVERAGE_WEIGHT: float = 2.0
 # threshold (rescue sparsely-described items where lexical coverage fails). 0 = apply globally.
 SEMANTIC_COVERAGE_GATE: float = 0.0
 
-# Fix 1 — bounded demotion. RRF weight of the retrieval order fused with the coverage order.
-# Stops coverage from sinking a strongly-retrieved but sparsely-described target out of top-k.
-# 0 = pure coverage sort (current behaviour); higher = more retrieval protection.
-COVERAGE_RETRIEVAL_WEIGHT: float = 0.0
+# Price proximity. The simulator discloses budget as "around $<target's own price>", so a candidate
+# whose price is close to the disclosed budget is strong entity-resolution evidence. Added into the
+# coverage SORT key (not the returned score, so belief stays clean). Off until measured.
+PRICE_PROXIMITY_WEIGHT: float = 2.0   # strength of the proximity bonus in the sort key
+PRICE_NEAR: float = 0.02              # |price-budget|/budget below this = exact-price match
+PRICE_LOOSE: float = 0.15             # below this = near match; beyond = mild evidence against
+PRICE_FAR_PENALTY: float = 0.1        # penalty slope for a present-but-far price (capped)
+
+# Initiative A — structured constraint coverage. A second ranking track that scores candidates
+# by how many NORMALIZED NeedModel constraints (material=leather, size=2T, polarity-aware) they
+# satisfy, matched against catalog text — not verbatim message phrases. Fused with the verbatim
+# coverage order via bounded RRF at this weight. This is the path by which regex/LLM slot
+# extraction reaches ranking, and it survives paraphrase (normalized values, not leaked tokens).
+# 0 = off (pure verbatim coverage, current behaviour).
+STRUCTURED_COVERAGE_WEIGHT: float = 0.0
+
+# --- NeedSatisfactionScorer (docs/RANKING_REDESIGN.md, Phase 1) --------------------------------
+# Alternate ranker: score each candidate by how well it SATISFIES the disclosed constraint phrases,
+# where match = max(verbatim-lexical IDF fraction, SATISFACTION_SEM_ALPHA * semantic cosine). Coverage
+# is the special case that uses only the lexical term; adding the semantic term makes the score
+# survive paraphrase (the reworded phrase matches the product's real vocabulary by meaning). Replaces
+# the coverage re-sort when on. Off by default until it beats coverage on eval_matrix (pop-ablated).
+USE_SATISFACTION_RANKER: bool = False
+# Weight on the semantic-cosine term relative to the verbatim-lexical term. 1.0 = a paraphrase match
+# (cosine ~0.5) competes with a partial verbatim match; 0 = pure lexical (reproduces coverage).
+SATISFACTION_SEM_ALPHA: float = 1.0
+# Adaptive popularity (Phase 2). eval_matrix showed popularity is the dominant villain on the honest
+# set (pure coverage leak-free 0.125 -> 0.767 with popularity removed) but HELPS the leaky public set.
+# So blend popularity as a prior weighted w_pop = SATISFACTION_POP_WEIGHT * (1 - specificity), where
+# specificity rises with how much discriminating signal the shopper disclosed: fame breaks ties when
+# the turn is vague, and fades to ~0 once the need is specific (so the long-tail target is not buried).
+SATISFACTION_POP_WEIGHT: float = 0.3
+# Number of disclosed constraint phrases at which specificity saturates to 1 (popularity -> 0).
+SATISFACTION_SPECIFICITY_REF: int = 3
+
+# Fix 1 — bounded demotion. RRF weight of the retrieval (dense+BM25) order fused with the verbatim
+# coverage order. When coverage cannot match reworded language it collapses to a popularity
+# tie-break and discards the semantic order dense retrieval already produced; this weight fuses that
+# order back in as a floor, so paraphrased queries keep their semantic ranking (no LLM required).
+# Sweep on the leak-free set (scripts/exp_retrieval_weight.py): flat 1.0 triples leak-free resilience
+# (0.125 -> 0.385) for -0.013 public; flat 2.0 -> 0.605 leak-free but -0.037 public. The gate below
+# (COVERAGE_INFORMATIVE_MIN) removes that tradeoff: with the floor applied ONLY on paraphrase turns,
+# this weight can run high (paraphrase branch) without touching verbatim turns. 0 = pure coverage.
+COVERAGE_RETRIEVAL_WEIGHT: float = 1.0
+
+# Discrimination floor gate. The retrieval floor above is applied ONLY when verbatim coverage failed
+# to single out the target — measured by whether the top candidate STANDS OUT from its rivals, not by
+# raw coverage magnitude (a magnitude gate is fooled by a shared brand anchor: coverage looks high
+# but every brand-mate carries it, so it identifies nothing). Normalized discrimination =
+# (top_cov − p_pctl_cov)/top_cov ∈ [0,1]: ~1 when only the target carries the disclosed words
+# (verbatim turn → floor OFF, protect public), ~0 when look-alikes share them (anchored paraphrase →
+# floor ON, lean on retrieval). This is the min discrimination for a turn to count as "coverage found
+# it". 0 = gate off (unconditional floor). Off by default: eval_matrix measured the gate lifts
+# leak-free further but costs public; the plain flat floor above is the proven default. Enable the
+# gate by raising this above 0 (0.5 is the studied starting point).
+COVERAGE_INFORMATIVE_MIN: float = 0.0
+# Pool percentile used as the rival reference in the gate (0.9 = p90 — does the top beat its closest
+# look-alikes, ignoring the mass of zero-coverage candidates). Higher = stricter gate.
+COVERAGE_DISCRIMINATION_PCTL: float = 0.9
+
+# Paraphrase pop-suppression. On a paraphrased turn (coverage uninformative per the gate above),
+# blending/tie-breaking on popularity collapses the order to "most famous" and re-pollutes the
+# semantic ranking the floor is preserving. When True, popularity is zeroed on exactly those turns
+# so coverage_order falls back to the retrieval order. Requires COVERAGE_INFORMATIVE_MIN > 0. Off by
+# default until the follow-up sweep measures it against the floor alone.
+SUPPRESS_POP_ON_PARAPHRASE: bool = False
 
 # Fix 3 — cap on the popularity term in the coverage blend, so ultra-popular lookalikes
 # cannot bury a low-popularity correct target. 0 = uncapped (current behaviour).
@@ -91,7 +164,7 @@ CE_DEPTH: int = 50    # candidates the cross-encoder rescores
 CE_WEIGHT: float = 1.0
 LLM_RERANK_DEPTH: int = 20
 LLM_WEIGHT: float = 0.3
-LLM_MODEL: str = "gemini-2.5-flash-lite"
+LLM_MODEL: str = "gemini-flash-lite-latest"
 # Fix 4 — only fire the optional rerankers when the belief margin is below this (top
 # candidates nearly tied), where reranking can help. 0 = always fire (current behaviour).
 RERANK_NEAR_TIE_MARGIN: float = 0.0

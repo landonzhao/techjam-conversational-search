@@ -107,6 +107,23 @@ ranking. Low sample count; note but do not over-invest yet.
 
 ---
 
+## Part 2b — Fix 1 result (bounded-demotion coverage), measured
+
+Sweeping `COVERAGE_RETRIEVAL_WEIGHT` (w_ret) on the 300-session synthetic sample, by tier:
+
+```
+w_ret  SCORE   hit    mrr   mttc  | easy hit/mrr | medium hit/mrr | hard hit/mrr
+0.0    0.7621  0.850  0.670 4.19  | 0.94/0.73    | 0.84/0.69      | 0.76/0.58   (current)
+0.3    0.8172  0.887  0.757 3.66  | 0.94/0.83    | 0.91/0.76      | 0.80/0.67
+0.6    0.8531  0.930  0.784 3.35  | 0.95/0.86    | 0.96/0.78      | 0.88/0.70
+1.0    0.8575  0.930  0.796 3.32  | 0.95/0.88    | 0.96/0.79      | 0.88/0.71
+```
+
+Confirmed: fusing retrieval order into the coverage sort rescues the well-retrieved targets
+coverage was burying. **+0.096 synthetic score**, every tier improves, hard-tier hit 0.76→0.88
+and MRR 0.58→0.71, and MTTC drops 4.19→3.32 (efficiency rises for free — Finding 4). w_ret=1.0
+best, 0.6 nearly identical. Guardrail (public/robustness) checked before flipping the default.
+
 ## Part 3 — Revised priorities (evidence-based)
 
 1. **Bounded-demotion coverage (Finding 2) — highest ROI.** Blend retrieval/dense rank into the

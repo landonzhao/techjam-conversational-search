@@ -29,7 +29,30 @@ class GeminiClientPool:
         pool = GeminiClientPool()
         if pool.available:
             resp = pool.generate_content(model=..., contents=..., config=...)
+
+    Token metering is process-wide: every successful call — from any component and any
+    pool instance — increments the class-level counters below. This is the single choke
+    point through which all Gemini traffic flows, so the agent can report honest per-turn
+    token usage by snapshotting `usage_totals()` around each turn, regardless of which
+    component (slot extraction, use-case inference, reranker, response generation) made
+    the call. Cached calls make no API request and correctly cost zero.
     """
+
+    _total_prompt_tokens = 0
+    _total_completion_tokens = 0
+
+    @classmethod
+    def usage_totals(cls) -> tuple[int, int]:
+        """Cumulative (prompt_tokens, completion_tokens) across every Gemini call so far."""
+        return cls._total_prompt_tokens, cls._total_completion_tokens
+
+    @classmethod
+    def _record_usage(cls, resp: object) -> None:
+        usage = getattr(resp, "usage_metadata", None)
+        if usage is None:
+            return
+        cls._total_prompt_tokens += int(getattr(usage, "prompt_token_count", 0) or 0)
+        cls._total_completion_tokens += int(getattr(usage, "candidates_token_count", 0) or 0)
 
     def __init__(self) -> None:
         try:
@@ -64,8 +87,10 @@ class GeminiClientPool:
         for _ in range(len(self._clients)):
             client = next(self._cycle)
             try:
-                return client.models.generate_content(
+                resp = client.models.generate_content(
                     model=model, contents=contents, config=config)
+                self._record_usage(resp)
+                return resp
             except Exception as exc:
                 msg = str(exc).lower()
                 if any(t in msg for t in ("429", "quota", "rate limit", "resource_exhausted")):

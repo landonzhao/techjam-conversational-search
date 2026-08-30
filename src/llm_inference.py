@@ -1,7 +1,12 @@
 """LLM-powered components: use-case inference, slot extraction, and response generation.
 
+═══ OPTIONAL LAYER — NOT on the critical scored path. ═══
+These are graceful-degradation hooks for unseen natural language. Every component fails safe to a
+deterministic fallback when the LLM is unavailable, and all are token-metered via src/keys.py.
+Their scored-metric contribution is currently unproven (slot extraction measured neutral); they
+exist for robustness to language the static tables do not cover, not to win the public score.
+
 Prompts live in prompts/ — edit them there, not here.
-All components fail safe to their deterministic fallback when the LLM is unavailable.
 """
 from __future__ import annotations
 
@@ -17,7 +22,7 @@ _PROMPT_PATH = Path(__file__).resolve().parents[1] / "prompts" / "use_case_infer
 _SYSTEM_PROMPT: str = _PROMPT_PATH.read_text(encoding="utf-8") if _PROMPT_PATH.exists() else ""
 
 _CACHE_PATH = Path("cache/llm_inference_cache.json")
-_DEFAULT_MODEL = "gemini-2.5-flash-lite"
+_DEFAULT_MODEL = "gemini-flash-lite-latest"
 
 
 class LLMUseCaseInferrer:
@@ -142,15 +147,37 @@ _SLOT_SYSTEM_PROMPT: str = (
 )
 _SLOT_CACHE_PATH = Path("cache/llm_slot_cache.json")
 
+# The fixed output vocabulary. Passed to the model as a JSON schema enum so it can only ever
+# emit one of these slots — novel language is MAPPED onto the fixed contract, never invented.
+_VALID_SLOTS = [
+    "material", "color", "size", "style", "use_case",
+    "budget", "feature", "category", "brand",
+]
+_SLOT_RESPONSE_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "slot": {"type": "string", "enum": _VALID_SLOTS},
+            "value": {"type": "string"},
+            "polarity": {"type": "integer"},  # +1 want / -1 avoid (validated in _parse)
+        },
+        "required": ["slot", "value", "polarity"],
+    },
+}
+
 
 class LLMSlotExtractor:
-    """Extract structured slot constraints from natural language using an LLM.
+    """Context-aware structured slot extraction from natural language using an LLM.
 
-    Fills the gap where the regex SlotFiller has no vocabulary coverage:
-    "budget-friendly", "office appropriate", "easy to wash", "not too flashy", etc.
+    Fills the gap where the regex SlotFiller has no vocabulary coverage ("budget-friendly",
+    "my daughter's recital", "keeps me warm without the itch"). The conversation history,
+    already-known slots, and product category are passed in so ambiguous messages
+    ("something warmer") resolve against context.
 
-    Responses are cached by message hash so each unique phrasing is only called once.
-    Falls back to an empty list when the LLM is unavailable or parsing fails.
+    Output is constrained by a JSON schema whose `slot` field is an enum, so the model can
+    only return one of the nine valid slots. Cached by (message + context) hash; falls back
+    to an empty list when the LLM is unavailable or parsing fails.
     """
 
     def __init__(self, model: str = _DEFAULT_MODEL) -> None:
@@ -167,31 +194,54 @@ class LLMSlotExtractor:
     def available(self) -> bool:
         return self._pool.available and bool(_SLOT_SYSTEM_PROMPT)
 
-    def extract(self, message: str) -> list[dict]:
-        """Return a list of {slot, value, polarity} dicts extracted from the message.
+    def extract(
+        self,
+        message: str,
+        conversation: list[str] | None = None,
+        known_slots: dict[str, str] | None = None,
+        category: str | None = None,
+    ) -> list[dict]:
+        """Return NEW/CHANGED {slot, value, polarity} constraints from `message`, read in the
+        context of the conversation so far, the slots already known, and the product category.
 
-        Returns [] on failure — callers should treat this as "no additional constraints found".
+        Returns [] on failure — callers treat this as "no additional constraints found".
         """
         if not self.available or not message.strip():
             return []
-        key = hashlib.sha1(message.encode()).hexdigest()
+        payload = self._build_payload(message, conversation, known_slots, category)
+        key = hashlib.sha1(payload.encode()).hexdigest()
         if key in self._cache:
             return self._cache[key]
-        result = self._call_llm(message)
+        result = self._call_llm(payload)
         self._cache[key] = result
         self._flush_cache()
         return result
 
-    def _call_llm(self, message: str) -> list[dict]:
+    @staticmethod
+    def _build_payload(
+        message: str, conversation: list[str] | None,
+        known_slots: dict[str, str] | None, category: str | None,
+    ) -> str:
+        """Compact JSON context block the model reads alongside the new message."""
+        recent = [m for m in (conversation or [])[-4:] if m.strip()]
+        return json.dumps({
+            "conversation_so_far": recent,
+            "already_known": known_slots or {},
+            "product_category": category,
+            "new_message": message,
+        }, ensure_ascii=False)
+
+    def _call_llm(self, payload: str) -> list[dict]:
         try:
             resp = self._pool.generate_content(
                 model=self._model,
-                contents=message,
+                contents=payload,
                 config=self._pool.types.GenerateContentConfig(
                     system_instruction=_SLOT_SYSTEM_PROMPT,
                     temperature=0.0,
                     max_output_tokens=512,
                     response_mime_type="application/json",
+                    response_schema=_SLOT_RESPONSE_SCHEMA,
                 ),
             )
             return self._parse(resp.text)
@@ -206,10 +256,7 @@ class LLMSlotExtractor:
             data = json.loads(text)
             if not isinstance(data, list):
                 return []
-            valid_slots = {
-                "material", "color", "size", "style", "use_case",
-                "budget", "feature", "category", "brand",
-            }
+            valid_slots = set(_VALID_SLOTS)
             out = []
             for item in data:
                 if not isinstance(item, dict):
