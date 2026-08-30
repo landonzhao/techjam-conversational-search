@@ -356,6 +356,159 @@ class SatisfactionScorerTest(unittest.TestCase):
         self.assertEqual(max(sat.values()), 0.0)
 
 
+class DualTrackRankerTest(unittest.TestCase):
+    def _ranker(self, vector=None):
+        from src.ranking import CoverageReranker, DualTrackRanker, NeedSatisfactionScorer
+        cat = {
+            "T": {"title": "zephyr corduroy jacket",
+                  "features": "rich napped pile warm lining",
+                  "rating_number": 1},
+            "B": {"title": "popular jacket", "features": "plain", "rating_number": 10000},
+            "S": {"title": "sparse", "rating_number": 1},
+        }
+        cov = CoverageReranker(cat)
+        return DualTrackRanker(cov, NeedSatisfactionScorer(cov, vector=vector))
+
+    def test_exact_discriminating_phrases_activate_coverage_track(self):
+        order, details = self._ranker().rank(
+            ["B", "T", "S"], ["zephyr", "napped pile"],
+            w_ret=0.1, w_sat=0.1, w_cov_high=3.0, popularity_weight=0.0,
+            min_exact_matches=2, discrimination_min=0.5, shared_max=0.8)
+        self.assertTrue(details["coverage_gate"])
+        self.assertEqual(order[0], "T")
+        self.assertGreater(details["coverage_weight"], 0.0)
+
+    def test_flat_coverage_preserves_retrieval_order_and_unknown_sparse_item(self):
+        order, details = self._ranker().rank(
+            ["S", "B", "T"], ["ribbed velvety fabric"],
+            w_ret=1.0, w_sat=1.0, w_cov_high=3.0, w_cov_low=0.0,
+            popularity_weight=0.0, min_exact_matches=2,
+            discrimination_min=0.5, shared_max=0.35)
+        self.assertFalse(details["coverage_gate"])
+        self.assertEqual(order[0], "S")
+        self.assertAlmostEqual(details["satisfaction"]["S"], 0.5)
+
+    def test_no_exact_evidence_guards_shallow_retrieval_candidates(self):
+        class NoisyVector:
+            @staticmethod
+            def phrase_similarity_matrix(_phrases, asins):
+                scores = {"T": [0.05], "B": [0.95], "S": [0.90]}
+                return {asin: scores[asin] for asin in asins}
+
+        ranker = self._ranker(vector=NoisyVector())
+        order, details = ranker.rank(
+            ["T", "B", "S"], ["unseen descriptive wording"],
+            w_ret=0.1, w_sat=1.0, w_cov_high=3.0, popularity_weight=0.0,
+            retrieval_guard_k=1, visible_k=2, guard_max_exact_matches=0,
+        )
+        self.assertIn("T", order[:2])
+        self.assertTrue(details["retrieval_guard"])
+
+    def test_complete_exact_phrase_disables_retrieval_guard(self):
+        class NoisyVector:
+            @staticmethod
+            def phrase_similarity_matrix(_phrases, asins):
+                scores = {"S": [0.05], "T": [0.95], "B": [0.90]}
+                return {asin: scores[asin] for asin in asins}
+
+        ranker = self._ranker(vector=NoisyVector())
+        order, details = ranker.rank(
+            ["S", "T", "B"], ["zephyr corduroy jacket"],
+            w_ret=0.0, w_sat=1.0, w_cov_high=3.0, popularity_weight=0.0,
+            min_exact_matches=1, discrimination_min=0.0, shared_max=1.0,
+            retrieval_guard_k=1, visible_k=2, guard_max_exact_matches=0,
+        )
+        self.assertNotIn("S", order[:2])
+        self.assertFalse(details["retrieval_guard"])
+
+    def test_cumulative_exact_coverage_rewards_shared_constraint_values(self):
+        ranker = self._ranker()
+        order, details = ranker.rank(
+            ["B", "S", "T"], [],
+            constraints=[("feature", "rich napped pile"), ("feature", "warm lining")],
+            w_ret=0.05, w_sat=0.0, w_cov_high=0.0, popularity_weight=0.0,
+            w_cumulative=5.0,
+        )
+        self.assertEqual(order[0], "T")
+        self.assertAlmostEqual(details["cumulative_coverage"]["T"], 1.0)
+        self.assertAlmostEqual(details["cumulative_coverage"]["B"], 0.0)
+        self.assertEqual(details["cumulative_coverage_weight"], 5.0)
+
+    def test_no_active_constraints_leave_cumulative_path_unchanged(self):
+        ranker = self._ranker()
+        kwargs = dict(
+            w_ret=1.0, w_sat=1.0, w_cov_high=0.0, w_cov_low=0.0,
+            popularity_weight=0.0, w_cumulative=5.0,
+        )
+        control_order, control = ranker.rank(
+            ["S", "B", "T"], ["completely reworded request without overlap"], **kwargs,
+        )
+        override_order, overridden = ranker.rank(
+            ["S", "B", "T"], ["completely reworded request without overlap"],
+            constraints=None, **kwargs,
+        )
+        self.assertEqual(override_order, control_order)
+        self.assertEqual(overridden["final"], control["final"])
+        self.assertEqual(set(overridden["cumulative_coverage"].values()), {0.0})
+
+    def test_active_ledger_values_are_counted(self):
+        from src.ranking import CoverageReranker, DualTrackRanker, NeedSatisfactionScorer
+        catalog = {
+            "A": {"title": "one", "features": "polyester button closure"},
+            "B": {"title": "two", "features": "cotton"},
+        }
+        coverage = CoverageReranker(catalog)
+        ranker = DualTrackRanker(coverage, NeedSatisfactionScorer(coverage))
+        _order, details = ranker.rank(
+            ["B", "A"], [], constraints=[("material", "polyester")],
+            w_ret=0.1, w_sat=0.0, w_cumulative=5.0,
+        )
+        self.assertEqual(_order[0], "A")
+        self.assertEqual(details["cumulative_coverage"]["A"], 1.0)
+
+    def test_cumulative_matching_uses_exact_token_boundaries(self):
+        from src.ranking import CoverageReranker
+        coverage = CoverageReranker({
+            "A": {"title": "redwood jacket"},
+            "B": {"title": "red jacket"},
+        })
+        scores = coverage.cumulative_exact_scores(
+            ["A", "B"], [("color", "red")])
+        self.assertEqual(scores, {"A": 0.0, "B": 1.0})
+
+    def test_raw_ngram_bonus_breaks_cumulative_ties(self):
+        ranker = self._ranker()
+        order, details = ranker.rank(
+            ["B", "T", "S"], [],
+            constraints=[("category", "jacket")],
+            raw_message="I need rich napped pile warm lining",
+            raw_ngram_bonus=0.5,
+            w_ret=0.01, w_sat=0.0, w_cumulative=1.0, popularity_weight=0.0,
+        )
+        self.assertEqual(order[0], "T")
+        self.assertGreater(details["raw_ngram_bonus"]["T"], 0.0)
+
+    def test_raw_ngrams_do_not_stitch_across_stopwords(self):
+        from src.ranking import CoverageReranker
+        coverage = CoverageReranker({"A": {"title": "red cotton"}})
+        self.assertEqual(
+            coverage._raw_ngrams("I want red and cotton"), set())
+
+    def test_popularity_resolves_equal_raw_overlap(self):
+        from src.ranking import CoverageReranker, DualTrackRanker, NeedSatisfactionScorer
+        coverage = CoverageReranker({
+            "A": {"title": "soft cotton shirt", "rating_number": 1},
+            "B": {"title": "soft cotton shirt", "rating_number": 100},
+        })
+        ranker = DualTrackRanker(coverage, NeedSatisfactionScorer(coverage))
+        order, _details = ranker.rank(
+            ["A", "B"], [], raw_message="soft cotton shirt",
+            raw_ngram_bonus=0.5, w_ret=0.0, w_sat=0.0, w_cumulative=0.0,
+            popularity_weight=0.1,
+        )
+        self.assertEqual(order[0], "B")
+
+
 class ScenarioMixTest(unittest.TestCase):
     def test_largest_remainder_matches_official_mix(self):
         from scripts.scenario_mix import largest_remainder_counts, scenario_schedule
@@ -377,6 +530,20 @@ class ScenarioMixTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             largest_remainder_counts(-1)
+
+
+class QuestionSelectorFormattingTest(unittest.TestCase):
+    def test_comparison_prompt_accepts_string_and_missing_prices(self):
+        from src.understanding import QuestionSelector
+
+        catalog = {
+            "A": {"title": "First jacket", "price": "29.99"},
+            "B": {"title": "Second jacket", "price": "not available"},
+        }
+        selector = QuestionSelector(catalog, lambda asin: catalog[asin]["title"], [])
+        phrase = selector._comparison_phrase(["A", "B"])
+        self.assertIn("($30)", phrase)
+        self.assertNotIn("not available", phrase)
 
 
 class DCPPersistenceTest(unittest.TestCase):

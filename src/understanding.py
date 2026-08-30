@@ -1030,11 +1030,26 @@ class QuestionSelector:
         t2 = str(self.catalog.get(a2, {}).get("title") or "")
         if not t1 or not t2 or t1[:40] == t2[:40]:
             return None
-        p1 = self.catalog.get(a1, {}).get("price")
-        p2 = self.catalog.get(a2, {}).get("price")
-        desc1 = f"{t1[:50]}" + (f" (${p1:.0f})" if p1 else "")
-        desc2 = f"{t2[:50]}" + (f" (${p2:.0f})" if p2 else "")
+        p1 = self._display_price(self.catalog.get(a1, {}).get("price"))
+        p2 = self._display_price(self.catalog.get(a2, {}).get("price"))
+        desc1 = f"{t1[:50]}" + (f" (${p1:.0f})" if p1 is not None else "")
+        desc2 = f"{t2[:50]}" + (f" (${p2:.0f})" if p2 is not None else "")
         return f"Are you looking for something more like '{desc1}' or '{desc2}'?"
+
+    @staticmethod
+    def _display_price(value: object) -> float | None:
+        """Normalize heterogeneous catalog prices for comparison prompts.
+
+        Some frozen catalog rows contain numeric strings rather than JSON numbers.  Ranking has
+        already completed when this prompt is built, so allowing a formatting exception here makes
+        the evaluator discard an otherwise valid top-10 response and falsely report a rank miss.
+        Missing, malformed, and non-positive prices are simply omitted from the prompt.
+        """
+        try:
+            price = float(value)
+        except (TypeError, ValueError):
+            return None
+        return price if price > 0 else None
 
 
 class RationaleBuilder:

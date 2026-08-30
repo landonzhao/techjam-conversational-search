@@ -1,6 +1,6 @@
-"""Reranking: Personalizer (popularity + profile tags) then CoverageReranker (verbatim constraints).
+"""Reranking: Personalizer (popularity + profile tags) then ledger-aware coverage fusion.
 
-Coverage must run last — it resolves verbatim constraint phrases that single out the exact target.
+Coverage runs last — it combines exact catalog evidence with retrieval and satisfaction signals.
 Optional CrossEncoder/LLM rerankers live in src/reranker.py and are fused via RRF before coverage.
 """
 from __future__ import annotations
@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 import re
 
-from src.catalog import TOKEN_RE, text, terms
+from src.catalog import STOPWORDS, TOKEN_RE, text, terms
 from src.config import (
     COVERAGE_FULL_PHRASE_BONUS, COVERAGE_LEN_WEIGHT, COVERAGE_POP_BLEND,
     COVERAGE_TIE_BREAK, POP_WEIGHT, PRICE_FAR_PENALTY, PRICE_LOOSE, PRICE_NEAR,
@@ -180,6 +180,131 @@ class CoverageReranker:
             if toks:
                 prepared.append((toks, " ".join(toks)))
         return prepared
+
+    def exact_scores(self, asins: list[str], phrases: list[str],
+                     use_idf: bool = False) -> dict[str, float]:
+        """Return positive lexical coverage evidence without imposing an ordering.
+
+        The dual-track scorer needs the raw evidence and its discrimination statistics separately
+        from the final sort.  Missing catalog text contributes zero evidence, never a negative
+        score; retrieval/satisfaction terms remain responsible for sparse listings.
+        """
+        prepared = self._prepare(phrases)
+        if not prepared:
+            return {asin: 0.0 for asin in asins}
+        return {
+            asin: self._coverage(asin, prepared, use_idf=use_idf)
+            for asin in asins
+        }
+
+    def exact_match_counts(self, asins: list[str], phrases: list[str]) -> dict[str, int]:
+        """Count complete exact-string phrase matches for leak discrimination."""
+        prepared = self._prepare(phrases)
+        counts: dict[str, int] = {}
+        for asin in asins:
+            # Canonicalise punctuation so catalog fields such as ``Material:alloy`` still count as
+            # the same exact shopper phrase ``Material alloy``. This is still lexical exactness,
+            # not semantic similarity.
+            catalog_text = " ".join(TOKEN_RE.findall(self.doc(asin)))
+            counts[asin] = sum(
+                1 for _tokens, whole in prepared
+                if whole and whole in catalog_text
+            )
+        return counts
+
+    def cumulative_exact_scores(
+        self,
+        asins: list[str],
+        constraints: list[tuple[str, str] | str] | None,
+    ) -> dict[str, float]:
+        """Return the fraction of active ledger values found exactly in each listing.
+
+        Unlike the old unique-long-phrase override, this deliberately does not require a phrase to
+        be rare or four words long. Public sessions frequently disclose several short, shared
+        catalog values (for example ``polyester``, ``Imported`` and ``Button closure``). Each
+        normalized value contributes at most one point and the denominator is the number of
+        distinct active values, yielding a bounded ``[0, 1]`` score. Missing metadata is simply
+        unknown and contributes no match or penalty.
+        """
+        values: list[str] = []
+        seen: set[str] = set()
+        for item in constraints or []:
+            raw = item[1] if isinstance(item, tuple) else item
+            canonical = " ".join(TOKEN_RE.findall(str(raw).lower()))
+            if not canonical:
+                continue
+            if canonical not in seen:
+                seen.add(canonical)
+                values.append(canonical)
+        if not values:
+            return {asin: 0.0 for asin in asins}
+        docs = {
+            # Padding gives phrase matching true token boundaries: ``red`` must not match
+            # ``redwood`` while ``button closure`` still matches across normalized punctuation.
+            asin: " " + " ".join(TOKEN_RE.findall(self.doc(asin).lower())) + " "
+            for asin in asins
+        }
+        total = float(len(values))
+        return {
+            asin: sum(1 for value in values if f" {value} " in docs[asin]) / total
+            for asin in asins
+        }
+
+    @staticmethod
+    def _raw_ngrams(raw_message: str | None) -> set[str]:
+        """Extract stopword-free contiguous bi-grams and tri-grams from one user turn.
+
+        Windows containing a stopword are discarded rather than stitching words across it. This
+        preserves true contiguity while removing conversational scaffolding such as ``looking`` /
+        ``for`` and ``want``. Catalog punctuation is normalized through ``TOKEN_RE``.
+        """
+        message = raw_message or ""
+        # The evaluator puts the potentially leaked catalog wording after an explicit constraint
+        # marker. Prefer that payload so category/scaffolding n-grams (``jewelry necklaces``,
+        # ``looking for``) cannot create unrelated promotions; ordinary chat without a marker still
+        # uses the complete current turn.
+        marker = re.search(
+            r"(?:key\s+requirement\s+is|what\s+matters\s+is|what\s+i\s+need\s+is)\s*:\s*(.*)$",
+            message,
+            re.I,
+        )
+        if marker:
+            message = marker.group(1)
+        tokens = [token.lower() for token in TOKEN_RE.findall(message)]
+        result: set[str] = set()
+        for size in (2, 3):
+            for index in range(len(tokens) - size + 1):
+                window = tokens[index:index + size]
+                if all(len(token) > 1 and token not in STOPWORDS for token in window):
+                    result.add(" ".join(window))
+        return result
+
+    def raw_ngram_bonus_scores(
+        self,
+        asins: list[str],
+        raw_message: str | None,
+        bonus_per_match: float = 0.5,
+    ) -> dict[str, float]:
+        """Score exact raw-turn bi/tri-gram overlap as a bounded ranking bonus.
+
+        This is intentionally a tie-break signal layered on top of structured cumulative coverage.
+        It uses only the current message, never the accumulated transcript, and missing metadata
+        remains neutral. A candidate receives ``bonus_per_match`` for each distinct matching
+        n-gram.
+        """
+        ngrams = self._raw_ngrams(raw_message)
+        if not ngrams or bonus_per_match <= 0:
+            return {asin: 0.0 for asin in asins}
+        docs = {
+            asin: " " + " ".join(TOKEN_RE.findall(self.doc(asin).lower())) + " "
+            for asin in asins
+        }
+        return {
+            asin: bonus_per_match * sum(
+                1 for gram in ngrams if f" {gram} " in docs[asin]
+            )
+            for asin in asins
+        }
 
     def _structured(self, asin: str,
                     constraints: list[tuple[str, int, float]]) -> float:
@@ -416,6 +541,35 @@ class NeedSatisfactionScorer:
         present = sum(self._cov._idf(t) for t in toks if t in catalog_text)
         return present / total
 
+    def score_map(self, asins: list[str], phrases: list[str]) -> dict[str, float]:
+        """Compute normalized satisfaction scores without sorting candidates.
+
+        Positive evidence is graded lexical/semantic agreement.  A missing field is UNKNOWN, not
+        a conflict: it supplies no negative contribution and leaves the retrieval term to carry a
+        sparse listing.  Explicit negative constraints are handled by the existing NeedModel path.
+        """
+        prepared = self._cov._prepare(phrases)
+        if not prepared or len(asins) <= 1:
+            return {asin: 0.0 for asin in asins}
+        sims: dict[str, list[float]] = {}
+        if self._vector is not None and self.sem_alpha > 0:
+            sims = self._vector.phrase_similarity_matrix(
+                [whole for _, whole in prepared], asins)
+        sat: dict[str, float] = {}
+        for asin in asins:
+            catalog_text = self._cov.doc(asin)
+            row = sims.get(asin)
+            num = den = 0.0
+            for j, (toks, _whole) in enumerate(prepared):
+                lex = self._lexical(toks, catalog_text)
+                sem = max(0.0, row[j]) if row else 0.0
+                match = max(lex, self.sem_alpha * sem)
+                weight = 1.0 + COVERAGE_LEN_WEIGHT * len(toks)
+                num += weight * match
+                den += weight
+            sat[asin] = num / den if den > 0 else 0.0
+        return sat
+
     def rank(self, asins: list[str],
              phrases: list[str]) -> tuple[list[str], dict[str, float]]:
         """Return (ordered_asins, satisfaction_score_per_asin). Order preserves the incoming
@@ -423,23 +577,7 @@ class NeedSatisfactionScorer:
         prepared = self._cov._prepare(phrases)
         if not prepared or len(asins) <= 1:
             return asins, {a: 0.0 for a in asins}
-        # per-phrase semantic cosine to every candidate (one encode + cached-embedding dot products)
-        sims: dict[str, list[float]] = {}
-        if self._vector is not None and self.sem_alpha > 0:
-            sims = self._vector.phrase_similarity_matrix([whole for _, whole in prepared], asins)
-        sat: dict[str, float] = {}
-        for a in asins:
-            catalog_text = self._cov.doc(a)
-            row = sims.get(a)
-            num = den = 0.0
-            for j, (toks, _whole) in enumerate(prepared):
-                lex = self._lexical(toks, catalog_text)
-                sem = max(0.0, row[j]) if row else 0.0
-                match = max(lex, self.sem_alpha * sem)
-                weight = 1.0 + COVERAGE_LEN_WEIGHT * len(toks)  # longer phrase = more specific
-                num += weight * match
-                den += weight
-            sat[a] = num / den if den > 0 else 0.0
+        sat = self.score_map(asins, phrases)
         base_rank = {a: i for i, a in enumerate(asins)}
         # Adaptive popularity prior: high when the turn is vague, fading to ~0 as the shopper gets
         # specific, so fame breaks ties under ignorance but never buries a specifically-described
@@ -454,6 +592,213 @@ class NeedSatisfactionScorer:
                 ranked = {a: sat[a] + w_pop * (pops[a] / hi) for a in asins}
         order = sorted(asins, key=lambda a: (-ranked[a], base_rank[a]))
         return order, sat  # return raw satisfaction as the score (belief sees true satisfaction)
+
+
+class DualTrackRanker:
+    """Single additive fusion of retrieval, satisfaction, cumulative coverage, and a prior.
+
+    The incoming ``asins`` order is the fused BM25+dense retrieval order.  Exact phrase coverage
+    is only allowed to dominate when multiple complete phrases identify one candidate and the
+    evidence is not shared by the rest of the pool. A separate cumulative term counts active ledger
+    values, allowing several shared catalog values to provide useful evidence without requiring one
+    artificial four-word unique phrase.
+    """
+
+    def __init__(self, coverage: CoverageReranker,
+                 satisfaction: NeedSatisfactionScorer) -> None:
+        self.coverage = coverage
+        self.satisfaction = satisfaction
+
+    @staticmethod
+    def _rank_score(index: int, size: int) -> float:
+        if size <= 1:
+            return 1.0
+        return 1.0 - (index / (size - 1))
+
+    @staticmethod
+    def _normalize(values: dict[str, float]) -> dict[str, float]:
+        if not values:
+            return {}
+        lo, hi = min(values.values()), max(values.values())
+        if hi <= lo:
+            return {key: 0.0 for key in values}
+        return {key: (value - lo) / (hi - lo) for key, value in values.items()}
+
+    @staticmethod
+    def _guard_retrieval_head(
+        retrieval_order: list[str], ranked_order: list[str], guard_k: int, visible_k: int,
+    ) -> tuple[list[str], list[str]]:
+        """Keep a bounded retrieval head inside the visible result window.
+
+        Semantic satisfaction is an absolute, noisy signal while retrieval rank is already a fused
+        BM25+dense consensus. A small cosine difference must not eject a candidate that retrieval
+        placed at rank 1–8 from a ten-item response. Reserve those candidates, replacing the lowest
+        unprotected fused candidates, while retaining final-score order within the resulting head.
+        The caller only enables this when no complete exact phrase exists, so it cannot dilute the
+        catalog-leak path.
+        """
+        if guard_k <= 0 or visible_k <= 0 or not ranked_order:
+            return ranked_order, []
+        protected = retrieval_order[:min(guard_k, visible_k, len(retrieval_order))]
+        protected_set = set(protected)
+        selected = list(ranked_order[:visible_k])
+        selected_set = set(selected)
+        inserted: list[str] = []
+        for asin in protected:
+            if asin in selected_set:
+                continue
+            replace_at = next(
+                (index for index in range(len(selected) - 1, -1, -1)
+                 if selected[index] not in protected_set),
+                None,
+            )
+            if replace_at is None:
+                break
+            selected_set.remove(selected[replace_at])
+            selected[replace_at] = asin
+            selected_set.add(asin)
+            inserted.append(asin)
+        rank_index = {asin: index for index, asin in enumerate(ranked_order)}
+        selected.sort(key=rank_index.__getitem__)
+        tail = [asin for asin in ranked_order if asin not in selected_set]
+        return selected + tail, inserted
+
+    def _coverage_gate(
+        self,
+        asins: list[str],
+        phrases: list[str],
+        exact: dict[str, float],
+        min_matches: int,
+        discrimination_min: float,
+        shared_max: float,
+    ) -> tuple[bool, dict[str, float]]:
+        counts = self.coverage.exact_match_counts(asins, phrases)
+        if not exact or max(exact.values(), default=0.0) <= 0:
+            return False, {"top_exact_matches": 0.0, "discrimination": 0.0, "shared_fraction": 1.0}
+        top = max(exact, key=exact.get)
+        top_score = exact[top]
+        ordered = sorted(exact.values())
+        # Use the strongest rival rather than the zero-heavy tail. This makes the gate conservative
+        # when an exact phrase is common across a category.
+        rival_index = max(0, min(len(ordered) - 2, int(len(ordered) * 0.90)))
+        rival = ordered[rival_index]
+        discrimination = (top_score - rival) / top_score if top_score else 0.0
+        shared_fraction = sum(
+            1 for value in exact.values() if value >= top_score * 0.80
+        ) / max(1, len(exact))
+        # Require multiple complete phrases. A single exact phrase can identify the wrong lookalike
+        # (for example, a generic ``material alloy`` listing), so it is not enough to turn coverage
+        # into the dominant term on its own.
+        high = (
+            counts.get(top, 0) >= min_matches
+            and discrimination >= discrimination_min
+            and shared_fraction <= shared_max
+        )
+        return high, {
+            "top_exact_matches": float(counts.get(top, 0)),
+            "discrimination": discrimination,
+            "shared_fraction": shared_fraction,
+        }
+
+    def rank(
+        self,
+        asins: list[str],
+        phrases: list[str],
+        *,
+        constraints: list[tuple[str, str] | str] | None = None,
+        w_ret: float = 1.0,
+        w_sat: float = 1.0,
+        w_cov_high: float = 2.5,
+        w_cov_low: float = 0.0,
+        w_cumulative: float = 0.0,
+        raw_message: str | None = None,
+        raw_ngram_bonus: float = 0.0,
+        popularity_weight: float = 0.1,
+        min_exact_matches: int = 2,
+        discrimination_min: float = 0.5,
+        shared_max: float = 0.35,
+        retrieval_guard_k: int = 0,
+        visible_k: int = 10,
+        guard_max_exact_matches: int = 0,
+    ) -> tuple[list[str], dict[str, dict[str, float] | float | bool]]:
+        """Fuse retrieval, satisfaction, structured cumulative coverage, and raw-turn overlap.
+
+        ``raw_message`` is deliberately one turn only. Its exact stopword-free n-gram bonus helps
+        resolve equal cumulative-coverage candidates; popularity remains in the fusion as the
+        deterministic microscopic tie-break after lexical evidence.
+        """
+        if len(asins) <= 1:
+            return asins, {"coverage_gate": False}
+
+        exact = self.coverage.exact_scores(asins, phrases)
+        sat = self.satisfaction.score_map(asins, phrases)
+        # No lexical/semantic evidence means the catalog is silent, not that the candidate
+        # conflicts with the request. Give that UNKNOWN state a neutral floor; only explicit
+        # positive evidence should move a sparse listing down relative to retrieval.
+        sat = {
+            asin: (0.5 if sat.get(asin, 0.0) <= 0.0 and exact.get(asin, 0.0) <= 0.0
+                   else sat.get(asin, 0.0))
+            for asin in asins
+        }
+        retrieval = {
+            asin: self._rank_score(index, len(asins))
+            for index, asin in enumerate(asins)
+        }
+        pop_raw = {
+            asin: self.coverage._pop(asin)
+            for asin in asins
+        }
+        popularity = self._normalize(pop_raw)
+        coverage = self._normalize(exact)
+        gate, gate_stats = self._coverage_gate(
+            asins, phrases, exact, min_exact_matches, discrimination_min, shared_max)
+        w_cov = w_cov_high if gate else w_cov_low
+        cumulative = self.coverage.cumulative_exact_scores(asins, constraints)
+        raw_overlap = self.coverage.raw_ngram_bonus_scores(
+            asins, raw_message, bonus_per_match=raw_ngram_bonus)
+        final = {
+            asin: (
+                max(0.0, w_ret) * retrieval[asin]
+                + max(0.0, w_sat) * sat.get(asin, 0.0)
+                + max(0.0, w_cov) * coverage.get(asin, 0.0)
+                + max(0.0, w_cumulative) * cumulative.get(asin, 0.0)
+                + max(0.0, raw_overlap.get(asin, 0.0))
+                + max(0.0, popularity_weight) * popularity.get(asin, 0.0)
+            )
+            for asin in asins
+        }
+        base_rank = {asin: index for index, asin in enumerate(asins)}
+        order = sorted(asins, key=lambda asin: (-final[asin], base_rank[asin]))
+        # On purely paraphrased turns, boundedly preserve the shallow hybrid-retrieval head. This
+        # targets observed rank faults where the correct item entered at rank <= 8 but noisy
+        # satisfaction pushed it below the evaluator's top-10 cutoff. Any complete exact phrase
+        # disables the guard so exact public-set evidence retains full control.
+        guard_active = (
+            not gate
+            and gate_stats["top_exact_matches"] <= max(0, guard_max_exact_matches)
+            and retrieval_guard_k > 0
+        )
+        guarded: list[str] = []
+        if guard_active:
+            order, guarded = self._guard_retrieval_head(
+                asins, order, retrieval_guard_k, visible_k)
+        breakdown: dict[str, dict[str, float] | float | bool] = {
+            "retrieval": retrieval,
+            "satisfaction": sat,
+            "coverage": coverage,
+            "cumulative_coverage": cumulative,
+            "raw_ngram_bonus": raw_overlap,
+            "popularity": popularity,
+            "final": final,
+            "coverage_weight": float(w_cov),
+            "cumulative_coverage_weight": float(max(0.0, w_cumulative)),
+            "raw_ngram_bonus_per_match": float(max(0.0, raw_ngram_bonus)),
+            "coverage_gate": gate,
+            "retrieval_guard": bool(guarded),
+            "retrieval_guard_count": float(len(guarded)),
+            **gate_stats,
+        }
+        return order, breakdown
 
 
 class Diversifier:

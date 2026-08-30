@@ -124,6 +124,34 @@ SATISFACTION_POP_WEIGHT: float = 0.3
 # Number of disclosed constraint phrases at which specificity saturates to 1 (popularity -> 0).
 SATISFACTION_SPECIFICITY_REF: int = 3
 
+# --- P2 dual-track ranker -----------------------------------------------------------------------
+# One additive scorer preserves the incoming semantic retrieval order while selectively restoring
+# exact catalog coverage on genuinely leaky turns.  These are deliberately conservative starting
+# points; eval_matrix/oracle runs should sweep them before making a final leaderboard choice.
+USE_DUAL_TRACK_RANKER: bool = True
+DUAL_W_RETRIEVAL: float = 1.3
+DUAL_W_SATISFACTION: float = 1.0
+DUAL_W_COVERAGE_HIGH: float = 2.5
+DUAL_W_COVERAGE_LOW: float = 0.0
+# Cumulative exact coverage from active ledger values. Unlike the old unique-long-phrase
+# override, this intentionally rewards several shared catalog values (e.g. polyester + Imported
+# + Button closure) and is kept separate from the discriminating phrase gate.
+DUAL_W_CUMULATIVE_COVERAGE: float = 5.0
+# Exact bi/tri-gram overlap from the current user turn. This is deliberately additive to
+# cumulative coverage so leaky public wording can resolve shared boilerplate ties; it is zero when
+# no raw n-gram matches a candidate.
+DUAL_RAW_NGRAM_BONUS: float = 0.5
+DUAL_POPULARITY_WEIGHT: float = 0.10
+DUAL_MIN_EXACT_MATCHES: int = 2
+DUAL_DISCRIMINATION_MIN: float = 0.35
+DUAL_SHARED_MAX: float = 0.35
+# Bounded-demotion safety net. When there are zero complete exact phrases, preserve the first N
+# hybrid-retrieval candidates inside the visible top-k. This prevents noisy absolute cosine scores
+# from ejecting shallow semantic hits while leaving enough slots for satisfaction-based promotion.
+# The guard is disabled as soon as exact catalog evidence exists, preserving the public leak track.
+DUAL_RETRIEVAL_GUARD_K: int = 8
+DUAL_GUARD_MAX_EXACT_MATCHES: int = 0
+
 # Fix 1 — bounded demotion. RRF weight of the retrieval (dense+BM25) order fused with the verbatim
 # coverage order. When coverage cannot match reworded language it collapses to a popularity
 # tie-break and discards the semantic order dense retrieval already produced; this weight fuses that

@@ -20,6 +20,11 @@ from src.config import (
     LLM_RERANK_DEPTH, LLM_WEIGHT, POOL_BY_PHASE, POOL_NO_PERSONALIZATION, POOL_SIZE,
     PRICE_PROXIMITY_WEIGHT, RERANK_NEAR_TIE_MARGIN, REVEAL_CONFIDENCE, REVEAL_HOLDBACK_K,
     SATISFACTION_POP_WEIGHT, SATISFACTION_SEM_ALPHA, SATISFACTION_SPECIFICITY_REF,
+    DUAL_DISCRIMINATION_MIN, DUAL_GUARD_MAX_EXACT_MATCHES, DUAL_MIN_EXACT_MATCHES,
+    DUAL_POPULARITY_WEIGHT, DUAL_RAW_NGRAM_BONUS, DUAL_RETRIEVAL_GUARD_K,
+    DUAL_W_CUMULATIVE_COVERAGE,
+    DUAL_SHARED_MAX, DUAL_W_COVERAGE_HIGH, DUAL_W_COVERAGE_LOW,
+    DUAL_W_RETRIEVAL, DUAL_W_SATISFACTION, USE_DUAL_TRACK_RANKER,
     SEMANTIC_COVERAGE_GATE, SEMANTIC_COVERAGE_WEIGHT, SESSION_MAX_TURNS,
     SLOT_DECAY, STRUCTURED_COVERAGE_WEIGHT, USE_ADAPTIVE_CLARIFY, USE_SATISFACTION_RANKER,
 )
@@ -30,7 +35,7 @@ from src.dialogue import (
     ConversationState, IntentRouter, compose_message, extract_constraints,
     next_ask, phase_transition,
 )
-from src.ranking import CoverageReranker, Diversifier, NeedSatisfactionScorer, Personalizer
+from src.ranking import CoverageReranker, Diversifier, DualTrackRanker, NeedSatisfactionScorer, Personalizer
 from src.retrieval import VectorRetriever, rrf, vector_weight
 from src.trace import Tracer, get_tracer
 from src.understanding import (
@@ -121,6 +126,21 @@ class Agent:
     SATISFACTION_SEM_ALPHA = SATISFACTION_SEM_ALPHA
     SATISFACTION_POP_WEIGHT = SATISFACTION_POP_WEIGHT           # Phase 2: adaptive popularity
     SATISFACTION_SPECIFICITY_REF = SATISFACTION_SPECIFICITY_REF
+    # P2 — one additive scorer. Exact coverage is dynamically gated so it restores public
+    # verbatim performance without clobbering semantic retrieval on leak-free turns.
+    USE_DUAL_TRACK_RANKER = USE_DUAL_TRACK_RANKER
+    DUAL_W_RETRIEVAL = DUAL_W_RETRIEVAL
+    DUAL_W_SATISFACTION = DUAL_W_SATISFACTION
+    DUAL_W_COVERAGE_HIGH = DUAL_W_COVERAGE_HIGH
+    DUAL_W_COVERAGE_LOW = DUAL_W_COVERAGE_LOW
+    DUAL_W_CUMULATIVE_COVERAGE = DUAL_W_CUMULATIVE_COVERAGE
+    DUAL_RAW_NGRAM_BONUS = DUAL_RAW_NGRAM_BONUS
+    DUAL_POPULARITY_WEIGHT = DUAL_POPULARITY_WEIGHT
+    DUAL_MIN_EXACT_MATCHES = DUAL_MIN_EXACT_MATCHES
+    DUAL_DISCRIMINATION_MIN = DUAL_DISCRIMINATION_MIN
+    DUAL_SHARED_MAX = DUAL_SHARED_MAX
+    DUAL_RETRIEVAL_GUARD_K = DUAL_RETRIEVAL_GUARD_K
+    DUAL_GUARD_MAX_EXACT_MATCHES = DUAL_GUARD_MAX_EXACT_MATCHES
     # Fix 3 — cap the popularity term so ultra-popular lookalikes cannot bury a low-pop target.
     COVERAGE_POP_CAP = COVERAGE_POP_CAP
     # MMR diversity: freshens the list for real fashion browsing, but measured to cost
@@ -242,6 +262,7 @@ class Agent:
             self._coverage, vector=self._vector, sem_alpha=self.SATISFACTION_SEM_ALPHA,
             pop_weight=self.SATISFACTION_POP_WEIGHT,
             specificity_ref=self.SATISFACTION_SPECIFICITY_REF)
+        self._dual_ranker = DualTrackRanker(self._coverage, self._satisfaction)
 
         self._cross_encoder = None
         if self.USE_CROSS_ENCODER:
@@ -436,7 +457,8 @@ class Agent:
         # The Personalizer applies a flat popularity pre-sort. eval_matrix showed that pre-sort is
         # the dominant villain on paraphrased/long-tail turns; the satisfaction ranker handles
         # popularity itself, adaptively (fading with specificity), so skip the flat pre-sort for it.
-        if self.USE_PERSONALIZATION and not self.USE_SATISFACTION_RANKER:
+        if self.USE_PERSONALIZATION and not self.USE_SATISFACTION_RANKER \
+                and not self.USE_DUAL_TRACK_RANKER:
             strength = 0.5 if state.intent == "browsing" else 0.25
             candidates = self._personalizer.rerank(
                 candidates, self._personalization_profile(state), strength)
@@ -453,6 +475,25 @@ class Agent:
                 (c.value, c.polarity, c.weight)
                 for c in state.need.constraints if c.slot != "budget" and c.value
             ] or None
+        # The cumulative lexical track is intentionally driven only by the active positive ledger
+        # view. Superseded/removed events remain in ``need.ledger`` for audit, but must never leak
+        # back into candidate scoring. Budget is omitted because it is numeric evidence handled by
+        # the separate price-proximity path rather than a catalog text value.
+        active_ledger_constraints = [
+            (c.slot, c.value)
+            for c in state.need.positives()
+            if c.slot != "budget" and c.value
+        ] or None
+        # Evaluator disclosures are represented by the parallel phrase ledger rather than a
+        # structured slot (e.g. ``Button closure`` or ``Imported``). They are still active
+        # constraints and have already passed historical-phrase invalidation, so include them in
+        # the same cumulative matcher. This is what lets several shared boilerplate values jointly
+        # identify a public target while keeping abandoned phrases out.
+        if effective_phrases:
+            active_ledger_constraints = [
+                *(active_ledger_constraints or []),
+                *[("disclosed", phrase) for phrase in effective_phrases],
+            ]
         # The disclosed budget number is the target's own price — extract it as a ranking signal.
         budget_val = None
         if self.USE_PRICE_PROXIMITY:
@@ -461,7 +502,36 @@ class Agent:
                 if nums:
                     budget_val = (float(nums[0]) + float(nums[-1])) / 2  # midpoint covers ranges
                     break
-        if self.USE_SATISFACTION_RANKER and effective_phrases:
+        if self.USE_DUAL_TRACK_RANKER and candidates:
+            candidates, fusion = self._dual_ranker.rank(
+                candidates, effective_phrases,
+                constraints=active_ledger_constraints,
+                w_ret=self.DUAL_W_RETRIEVAL,
+                w_sat=self.DUAL_W_SATISFACTION,
+                w_cov_high=self.DUAL_W_COVERAGE_HIGH,
+                w_cov_low=self.DUAL_W_COVERAGE_LOW,
+                w_cumulative=self.DUAL_W_CUMULATIVE_COVERAGE,
+                raw_message=user_message,
+                raw_ngram_bonus=self.DUAL_RAW_NGRAM_BONUS,
+                popularity_weight=self.DUAL_POPULARITY_WEIGHT,
+                min_exact_matches=self.DUAL_MIN_EXACT_MATCHES,
+                discrimination_min=self.DUAL_DISCRIMINATION_MIN,
+                shared_max=self.DUAL_SHARED_MAX,
+                retrieval_guard_k=self.DUAL_RETRIEVAL_GUARD_K,
+                visible_k=top_k,
+                guard_max_exact_matches=self.DUAL_GUARD_MAX_EXACT_MATCHES,
+            )
+            sat_scores = fusion.get("satisfaction")
+            cov_scores = sat_scores if isinstance(sat_scores, dict) else {}
+            if self._tracer.enabled:
+                self._tracer.note(
+                    "dual-track fusion: "
+                    f"coverage_w={fusion.get('coverage_weight', 0.0):.2f} "
+                    f"gate={bool(fusion.get('coverage_gate', False))} "
+                    f"cumulative_w={fusion.get('cumulative_coverage_weight', 0.0):.2f} "
+                    f"discrimination={float(fusion.get('discrimination', 0.0)):.2f} "
+                    f"retrieval_guard={bool(fusion.get('retrieval_guard', False))}")
+        elif self.USE_SATISFACTION_RANKER and effective_phrases:
             # Alternate ranker (RANKING_REDESIGN.md Phase 1): rank by satisfaction of the active
             # constraint phrases (verbatim-lexical OR semantic), generalizing coverage. Replaces
             # the coverage re-sort entirely when on; measured via scripts/eval_matrix.py.

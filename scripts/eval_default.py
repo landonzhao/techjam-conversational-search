@@ -38,8 +38,15 @@ def main() -> None:
     Agent.USE_LLM_RERANK = False
     agent = new_isolated_agent(CATALOG)
     print("CURRENT DEFAULT CONFIG — official evaluator", flush=True)
-    print(f"  retrieval_floor={agent.COVERAGE_RETRIEVAL_WEIGHT}  gate={agent.COVERAGE_INFORMATIVE_MIN}  "
-          f"satisfaction={agent.USE_SATISFACTION_RANKER}", flush=True)
+    print(
+        f"  dual_track={agent.USE_DUAL_TRACK_RANKER}  "
+        f"retrieval_weight={agent.DUAL_W_RETRIEVAL}  "
+        f"retrieval_guard_k={agent.DUAL_RETRIEVAL_GUARD_K}  "
+        f"coverage_high={agent.DUAL_W_COVERAGE_HIGH}  "
+        f"cumulative_coverage={agent.DUAL_W_CUMULATIVE_COVERAGE}  "
+        f"raw_ngram_bonus={agent.DUAL_RAW_NGRAM_BONUS}",
+        flush=True,
+    )
 
     t0 = time.time()
     show("PUBLIC (leaderboard)", evaluate(agent, load_jsonl("data/public_set.jsonl"),
