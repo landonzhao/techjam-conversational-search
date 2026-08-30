@@ -12,9 +12,14 @@ Usage:  python -u scripts/exp_earned_wins.py
 from __future__ import annotations
 
 import time
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evaluator.local_evaluator import catalog_index, evaluate, load_jsonl
 from evaluator.robustness import run as robrun
+from scripts.eval_support import new_isolated_agent
 from src.agent import Agent
 
 CATALOG = "data/catalog.jsonl"
@@ -30,7 +35,7 @@ def main() -> None:
     Agent.USE_LLM_INFERENCE = False
     Agent.USE_LLM_RESPONSE = False
     Agent.USE_LLM_RERANK = False
-    agent = Agent(CATALOG)
+    agent = new_isolated_agent(CATALOG)
 
     # (label, price_weight, structured_weight)
     rows = [

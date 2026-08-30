@@ -180,8 +180,18 @@ class Agent:
     DCP_PROFILE = True
     DCP_ORCHESTRATION = True
     DCP_GUIDANCE_LEARNING = True
+    DCP_PERSISTENCE = True
 
-    def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
+    # Evaluation-only override.  ``None`` preserves the normal phase-dependent pool policy;
+    # a value pins the candidate pool without changing personalization or popularity controls.
+    POOL_SIZE_OVERRIDE: int | None = None
+
+    def __init__(
+        self,
+        catalog_path: str | Path = "data/catalog.jsonl",
+        dcp_state_dir: str | Path | None = None,
+        persist_dcp: bool | None = None,
+    ) -> None:
         try:
             from dotenv import load_dotenv
             load_dotenv()
@@ -242,9 +252,14 @@ class Agent:
                 pass
 
         self._distiller = ContextDistiller()
-        self._profiles = ProfileService()
+        if persist_dcp is None:
+            persist_dcp = self.DCP_PERSISTENCE
+        state_dir = Path(dcp_state_dir) if dcp_state_dir is not None else None
+        profile_path = str(state_dir / "profiles.json") if state_dir is not None else None
+        guidance_path = str(state_dir / "guidance_global.json") if state_dir is not None else None
+        self._profiles = ProfileService(path=profile_path, persistent=persist_dcp)
         self._policy = OrchestrationPolicy()
-        self._guidance = GuidanceLearner()
+        self._guidance = GuidanceLearner(path=guidance_path, persistent=persist_dcp)
 
         self._slot_extractor = LLMSlotExtractor() if self.USE_LLM_SLOTS else None
         self._response_gen = LLMResponseGenerator() if self.USE_LLM_RESPONSE else None
@@ -623,6 +638,8 @@ class Agent:
         return picks
 
     def _pool_size(self, state: ConversationState) -> int:
+        if self.POOL_SIZE_OVERRIDE is not None:
+            return max(1, int(self.POOL_SIZE_OVERRIDE))
         if not self.USE_PERSONALIZATION:
             return POOL_NO_PERSONALIZATION
         if self.USE_DCP and self.DCP_ORCHESTRATION and state.plan is not None:

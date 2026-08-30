@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evaluator.local_evaluator import catalog_index, evaluate, load_jsonl
+from scripts.eval_support import new_isolated_agent
 from src.agent import Agent
 
 
@@ -76,7 +77,7 @@ def main() -> None:
         samples = samples[: args.limit]
     catalog_ids, categories, products = catalog_index(args.catalog)
 
-    agent = TracingAgent(args.catalog)
+    agent = new_isolated_agent(args.catalog, agent_cls=TracingAgent)
     agent.bind_samples(samples)
     result = evaluate(agent, samples, catalog_ids, categories, products)
     agent._tracer.close()

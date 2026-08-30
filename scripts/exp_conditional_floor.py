@@ -12,8 +12,13 @@ Usage:  python -u scripts/exp_conditional_floor.py
 from __future__ import annotations
 
 import time
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evaluator.local_evaluator import catalog_index, evaluate, load_jsonl
+from scripts.eval_support import new_isolated_agent
 from src.agent import Agent
 
 CATALOG = "data/catalog.jsonl"
@@ -35,7 +40,7 @@ def main() -> None:
     Agent.USE_LLM_INFERENCE = False
     Agent.USE_LLM_RESPONSE = False
     Agent.USE_LLM_RERANK = False
-    agent = Agent(CATALOG)
+    agent = new_isolated_agent(CATALOG)
 
     header = (f"{'config':>26} | {'PUB-'+str(PUBLIC_GUARD_N):>7} {'hit':>6} {'mrr':>7} | "
               f"{'LEAK-FREE':>9} {'hit':>6} {'mrr':>7}")

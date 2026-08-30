@@ -158,22 +158,23 @@ class UserProfile:
 
 
 class ProfileService:
-    """Persistent, time-decaying per-user preference store (cache/profiles.json).
+    """Time-decaying per-user preference store with an explicit persistence switch.
 
     Keyed by a hash of the anonymized profile; in offline evaluation each session is fresh,
-    so write-through never feeds a subsequent session's read.
+    so benchmark callers should set ``persistent=False`` and use an ephemeral path.
     """
 
     EMA = 0.6              # write-through blend of durable weight toward the new session
     HALFLIFE_DAYS = 45.0   # decay applied at read time
     PRUNE_EPS = 0.05
 
-    def __init__(self, path: str | None = None) -> None:
+    def __init__(self, path: str | None = None, persistent: bool = True) -> None:
         from src.config import PROFILE_STORE
         path = path or PROFILE_STORE
         self.path = Path(path)
+        self.persistent = persistent
         self._store: dict[str, dict] = {}
-        if self.path.exists():
+        if self.persistent and self.path.exists():
             try:
                 self._store = json.loads(self.path.read_text(encoding="utf-8"))
             except Exception:
@@ -237,6 +238,8 @@ class ProfileService:
         self._store[up.user_id] = up.as_dict()
 
     def _flush(self) -> None:
+        if not self.persistent:
+            return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(json.dumps(self._store), encoding="utf-8")
@@ -299,13 +302,14 @@ class GuidanceLearner:
     LAMBDA = 0.5  # guidance multiplier strength
     EMA = 0.3     # online update rate
 
-    def __init__(self, path: str | None = None) -> None:
+    def __init__(self, path: str | None = None, persistent: bool = True) -> None:
         from src.config import GUIDANCE_STORE
         path = path or GUIDANCE_STORE
         self.path = Path(path)
+        self.persistent = persistent
         self.stats: dict[str, float] = {}
         self.waveoff: dict[str, float] = {}
-        if self.path.exists():
+        if self.persistent and self.path.exists():
             try:
                 d = json.loads(self.path.read_text(encoding="utf-8"))
                 self.stats = dict(d.get("stats", {}))
@@ -346,6 +350,8 @@ class GuidanceLearner:
         return out
 
     def _flush(self) -> None:
+        if not self.persistent:
+            return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(

@@ -34,7 +34,9 @@ RRF_K: int = 60  # rank smoothing constant in 1/(k+rank)
 # Candidate pool
 POOL_SIZE: int = 200          # default pool for retrieval (measured: 50→200 lifted MRR)
 POOL_BY_PHASE: dict[str, int] = {"explore": 200, "converge": 200, "deliver": 120}
-POOL_NO_PERSONALIZATION: int = 10  # minimal pool when Personalizer is disabled
+# Legacy fallback retained for callers that explicitly request the old policy. Benchmark code must
+# use Agent.POOL_SIZE_OVERRIDE instead: disabling popularity/profile signals must not shrink recall.
+POOL_NO_PERSONALIZATION: int = 10
 
 # ---------------------------------------------------------------------------
 # Synonym expansion
