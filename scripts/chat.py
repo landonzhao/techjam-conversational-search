@@ -76,11 +76,14 @@ def main() -> None:
             if st.profile is not None:
                 print(f"  DCP profile: {len(st.profile.prefs)} durable prefs "
                       f"{[(p.slot, p.value) for p in st.profile.prefs][:6]}")
+                active_profile = agent._personalization_profile(st)
+                print(f"  personalization profile: {active_profile.get('preference_tags', [])[:8]}")
             if agent._guidance.stats:
                 print(f"  DCP guidance: "
                       f"{{k: round(v, 3) for k, v in agent._guidance.stats.items()}}")
-            print(f"  disclosed constraints: {st.constraint_phrases}")
-            print(f"  accumulated query: {st.query_text()[:200]}\n")
+            print(f"  disclosed constraints (active): {st.effective_constraint_phrases()}")
+            print(f"  active ledger: {[(c.operation, c.slot, c.value, c.active) for c in st.need.ledger][-12:]}")
+            print(f"  effective query: {st.query_text()[:200]}\n")
             continue
 
         turn += 1

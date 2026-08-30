@@ -25,9 +25,16 @@ COLOR_RE = re.compile(
 STYLE_RE = re.compile(
     r"\b(slim|relaxed|crew|v-neck|vneck|scoop|high-waisted|bootcut|skinny|straight|"
     r"oversized|cropped|hooded|sleeveless|button|turtleneck|a-line|wrap)\b", re.I)
+FEATURE_RE = re.compile(
+    r"\b(waterproof|water[- ]resistant|breathable|comfortable|comfy|warm|lightweight|"
+    r"durable|stretchy|machine washable|insulated|cushioned|packable)\b", re.I)
+# Apostrophes are non-word characters to Python's ``\b``.  Without the explicit guards below,
+# the ``m`` in ``I'm`` and the ``s`` in ``Valentine's`` look like standalone sizes.  Keep the
+# single-letter sizes useful (``size m``, ``m``), but never accept a token adjacent to an ASCII or
+# curly apostrophe.
 SIZE_RE = re.compile(
-    r"\b(xs|s|m|l|xl|xxl|xxxl|small|medium|large|x-?large|xx-?large|petite|plus|"
-    r"wide|narrow|size\s*\d{1,2})\b", re.I)
+    r"(?<!['’])\b(size\s*\d{1,2}|xxxl|xxl|xl|xs|x-?large|xx-?large|small|medium|large|"
+    r"petite|plus|wide|narrow|s|m|l)\b(?!['’])", re.I)
 # budget: "under $50", "$40-60", "around $30", "below 25"
 BUDGET_RE = re.compile(
     r"(?:under|below|less than|<=?)\s*\$?\s*(\d+(?:\.\d+)?)"
@@ -35,7 +42,7 @@ BUDGET_RE = re.compile(
     r"|(?:around|about|~|budget of)\s*\$?\s*(\d+)", re.I)
 # a negated adjective/noun: "not bulky", "no logo", "without pockets", "nothing too heavy"
 NEG_FEATURE_RE = re.compile(
-    r"\b(?:not|no|without|avoid|nothing|isn'?t|aren'?t|don'?t|too)\s+"
+    r"\b(?:not|no|without|avoid|remove|drop|ditch|skip|exclude|nothing|isn'?t|aren'?t|don'?t|too)\s+"
     r"(?:too\s+|so\s+|very\s+)?([a-z]{3,})", re.I)
 
 USE_CASE_KEYS = (
@@ -53,6 +60,7 @@ CATEGORY_CANON: dict[str, str] = {
     "boot": "boot", "bootie": "boot",
     "sandal": "sandal", "flip-flop": "sandal", "flipflop": "sandal",
     "shoe": "shoe", "loafer": "shoe", "moccasin": "shoe", "heel": "shoe",
+    "slipper": "shoe",
     # tops / outerwear
     "jacket": "jacket", "parka": "jacket", "windbreaker": "jacket", "blazer": "jacket",
     "coat": "coat", "overcoat": "coat", "raincoat": "coat",
@@ -81,6 +89,7 @@ CATEGORY_CANON: dict[str, str] = {
     "hobo": "bag", "clutch": "bag", "satchel": "bag", "crossbody": "bag", "wallet": "wallet",
     "watch": "watch",
     "ring": "ring", "necklace": "necklace", "bracelet": "bracelet", "earrings": "earrings",
+    "bucket hat": "hat", "bucket": "hat",
     "hat": "hat", "cap": "hat", "beanie": "hat", "visor": "hat",
 }
 # Legacy tuple kept for callers that iterate canonical buckets.
@@ -99,8 +108,27 @@ def resolve_category(low: str) -> str | None:
             best = (m.start(), canon)
     return best[1] if best else None
 
-NEG_CUES = {"not", "no", "without", "avoid", "don't", "dont", "isn't", "isnt",
-            "aren't", "arent", "nothing", "never", "less", "too"}
+
+def _category_matches(low: str) -> list[tuple[int, int, str, str]]:
+    """Return non-overlapping category mentions as (start, end, surface, canonical).
+
+    At the same position the longest surface wins (``bucket hat`` over ``bucket``).
+    """
+    found: list[tuple[int, int, str, str]] = []
+    for surface, canon in CATEGORY_CANON.items():
+        for match in re.finditer(rf"\b{re.escape(surface)}s?\b", low):
+            found.append((match.start(), match.end(), match.group(0), canon))
+    found.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    result: list[tuple[int, int, str, str]] = []
+    for item in found:
+        if result and item[0] < result[-1][1]:
+            continue
+        result.append(item)
+    return result
+
+NEG_CUES = {"not", "no", "without", "avoid", "remove", "drop", "ditch", "skip", "exclude",
+            "don't", "dont", "isn't", "isnt", "aren't", "arent", "nothing", "never",
+            "less", "too"}
 STRONG_CUES = {"must", "need", "needs", "required", "essential", "very", "really", "definitely"}
 SOFT_CUES = {"prefer", "ideally", "maybe", "somewhat", "slightly", "kinda", "kind"}
 STOP_FEATURE = {"the", "and", "for", "with", "that", "this", "one", "any", "much", "many",
@@ -123,12 +151,18 @@ def _ngrams(low: str, n_max: int = 3) -> set[str]:
 
 @dataclass
 class Constraint:
-    """One structured, polarity-aware need atom parsed from the conversation."""
+    """One ordered preference-ledger event parsed from the conversation."""
     slot: str            # material | color | size | style | budget | use_case | category | feature
     value: str           # normalized value, e.g. "leather", "bulky", "under 50"
-    polarity: int = 1    # +1 want, -1 avoid
+    polarity: int = 1    # +1 want, -1 avoid, 0 for CLEAR / NO_PREFERENCE
     weight: float = 1.0  # 1.0 hard ("must"), 0.5 soft ("prefer")
     turn: int = 0
+    operation: str | None = None  # SET | ADD | REMOVE | CLEAR | NO_PREFERENCE
+    span: tuple[int, int] | None = None
+    surface: str | None = None
+    source: str = "regex"
+    confidence: float = 1.0
+    active: bool = True
 
     def key(self) -> tuple[str, str]:
         return (self.slot, _norm(self.value))
@@ -139,16 +173,159 @@ class NeedModel:
     """The session's revisable structured understanding of what the shopper wants."""
     constraints: list[Constraint] = field(default_factory=list)
     category: str | None = None
+    ledger: list[Constraint] = field(default_factory=list)
+    no_preference: set[str] = field(default_factory=set)
+
+    EXCLUSIVE_SLOTS = frozenset({"category", "brand", "color", "size", "budget"})
+    CATEGORY_MODIFIER_SLOTS = frozenset({
+        "material", "color", "style", "feature", "brand", "size", "budget",
+    })
+    VALID_OPERATIONS = frozenset({"SET", "ADD", "REMOVE", "CLEAR", "NO_PREFERENCE"})
+
+    def _deactivate(self, predicate) -> None:
+        for old in self.constraints:
+            if predicate(old):
+                old.active = False
+        self.constraints = [old for old in self.constraints if old.active]
+
+    def _last_active_slot(self) -> str | None:
+        for event in reversed(self.ledger):
+            if event.active and event.slot != "__last__":
+                return event.slot
+        return None
+
+    def _refresh_category(self) -> None:
+        cats = self.positives("category")
+        self.category = cats[-1].value if cats else None
 
     def revise(self, new: list[Constraint]) -> None:
-        """Non-monotonic merge: a new constraint on the same (slot, value) supersedes the
-        old one (newer turn wins), so 'actually, not down' flips a prior 'down'. Different
-        values on the same slot coexist (multi-value slots)."""
+        """Apply ordered SET/ADD/REMOVE/CLEAR/NO_PREFERENCE ledger operations.
+
+        ``constraints`` remains the backwards-compatible active view consumed by ranking;
+        ``ledger`` retains every event, including superseded events, for audit and query masking.
+        """
         for c in new:
-            self.constraints = [x for x in self.constraints if x.key() != c.key()]
+            c.value = _norm(c.value)
+            op = (c.operation or (
+                "REMOVE" if c.polarity < 0
+                else "SET" if c.slot in self.EXCLUSIVE_SLOTS
+                else "ADD"
+            )).upper()
+            if op not in self.VALID_OPERATIONS:
+                op = "ADD"
+            c.operation = op
+
+            if c.slot == "__last__" and op in {"CLEAR", "NO_PREFERENCE"}:
+                c.slot = self._last_active_slot() or "__last__"
+
+            if op in {"CLEAR", "NO_PREFERENCE"}:
+                if c.slot == "__modifiers__":
+                    self._deactivate(lambda old: old.slot in self.CATEGORY_MODIFIER_SLOTS)
+                else:
+                    self._deactivate(lambda old, slot=c.slot: old.slot == slot)
+                c.polarity = 0
+                c.active = False
+                if op == "NO_PREFERENCE" and c.slot != "__last__":
+                    self.no_preference.add(c.slot)
+                elif c.slot != "__last__":
+                    self.no_preference.discard(c.slot)
+                self.ledger.append(c)
+                self._refresh_category()
+                continue
+
+            self.no_preference.discard(c.slot)
+            previous_category = self.category
+            if op == "SET":
+                # A new positive exclusive value supersedes other positive values. Explicit
+                # negatives for *different* values remain useful ("not red, blue").
+                self._deactivate(
+                    lambda old, cur=c: old.slot == cur.slot
+                    and (old.polarity > 0 or old.key() == cur.key()))
+                c.polarity = 1
+            elif op == "ADD":
+                self._deactivate(lambda old, cur=c: old.key() == cur.key())
+                c.polarity = 1
+            else:  # REMOVE
+                self._deactivate(lambda old, cur=c: old.key() == cur.key())
+                c.polarity = -1
+
+            c.active = True
             self.constraints.append(c)
-            if c.slot == "category" and c.polarity > 0:
-                self.category = c.value
+            self.ledger.append(c)
+            self._refresh_category()
+
+            if (c.slot == "category" and c.polarity > 0
+                    and previous_category and previous_category != c.value):
+                # A category transition starts a new product branch. Retire positive modifiers
+                # learned before this switch (including prior turns and earlier spans in this
+                # turn); use-case intent is deliberately retained because it can carry across
+                # footwear transitions (running shoes) and is handled separately below.
+                switch_start = c.span[0] if c.span else None
+                prior_category_start = None
+                if switch_start is not None:
+                    same_turn = [
+                        old for old in self.ledger
+                        if old.slot == "category" and old.turn == c.turn
+                        and old.value == previous_category and old.span
+                        and old.span[0] < switch_start
+                    ]
+                    if same_turn:
+                        prior_category_start = min(old.span[0] for old in same_turn)
+                self._deactivate(
+                    lambda old: old.slot in self.CATEGORY_MODIFIER_SLOTS
+                    and old.polarity > 0
+                    and (old.turn < c.turn or switch_start is None
+                         or (prior_category_start is not None and old.span
+                             and old.span[0] < switch_start)))
+                self._refresh_category()
+
+            if (c.slot == "category" and c.polarity > 0 and c.value == "shoe"
+                    and previous_category == "boot"):
+                # Category-dependent context from the abandoned boot branch must not survive a
+                # footwear switch; a subsequent running preference can then stand on its own.
+                self._deactivate(
+                    lambda old: old.slot == "use_case"
+                    and old.value == "hiking" and old.polarity > 0)
+                self._refresh_category()
+
+            # Running is a strong footwear correction signal. In noisy speech a shopper may say
+            # "running kind" or "running does" without repeating "shoes"; when the active
+            # category is boots, infer the canonical shoe switch and retire hiking (the old boot
+            # use-case) as well. Explicit "running shoes" is still handled by the category parser.
+            if (c.slot == "use_case" and c.polarity > 0 and c.value == "running"
+                    and previous_category == "boot" and self.category == "boot"):
+                inferred = Constraint(
+                    "category", "shoe", 1, c.weight, c.turn,
+                    operation="SET", source="regex_inferred", confidence=0.85,
+                )
+                self.revise([inferred])
+                self._deactivate(
+                    lambda old: old.slot == "use_case"
+                    and old.value == "hiking" and old.polarity > 0)
+                self._refresh_category()
+
+        # When both signals occur in one noisy turn ("running shoes like hiking boots"), the
+        # running-shoe request is the final footwear intent; do not leave the boot use-case alive.
+        if (any(c.slot == "use_case" and c.value == "running" and c.polarity > 0
+                for c in new) and self.category == "shoe"
+                and any(c.slot == "use_case" and c.value == "running" and c.polarity > 0
+                        for c in self.constraints)):
+            self._deactivate(
+                lambda old: old.slot == "use_case"
+                and old.value == "hiking" and old.polarity > 0)
+
+    def active_signature(self) -> tuple[tuple[str, str, int], ...]:
+        return tuple((c.slot, c.value, c.polarity) for c in self.constraints)
+
+    def excluded_terms(self) -> set[str]:
+        """Terms explicitly rejected or superseded and not active as a positive value."""
+        active = {c.value for c in self.positives()}
+        excluded: set[str] = set()
+        for event in self.ledger:
+            if event.value and (not event.active or event.polarity <= 0):
+                excluded.add(_norm(event.surface or event.value))
+                excluded.add(event.value)
+        return {term for term in excluded if term and term not in active}
 
     def positives(self, slot: str | None = None) -> list[Constraint]:
         return [c for c in self.constraints if c.polarity > 0 and (slot is None or c.slot == slot)]
@@ -161,13 +338,14 @@ class NeedModel:
 
     def describe(self) -> str:
         """Human-readable dump for chat.py :state."""
-        if not self.constraints:
+        if not self.constraints and not self.no_preference:
             return "(no structured constraints yet)"
         parts = []
         for c in self.constraints:
             sign = "+" if c.polarity > 0 else "−"
             w = "" if c.weight >= 1.0 else "~"
             parts.append(f"{sign}{w}{c.slot}:{c.value}")
+        parts.extend(f"∅{slot}:no-preference" for slot in sorted(self.no_preference))
         return "  ".join(parts)
 
 
@@ -175,18 +353,68 @@ def _clause_before(low: str, start: int, window: int) -> str:
     """Text just before `start`, clipped to the current clause (don't cross , ; . / and/but)
     so a negation in a previous clause doesn't leak into this constraint."""
     pre = low[max(0, start - window):start]
-    pre = re.split(r"[,;.]|\band\b|\bbut\b", pre)[-1]
+    pre = re.split(
+        r"[,;.]|\band\b|\bbut\b|\b(?:actually|actly|instead|rather|"
+        r"scratch that|never ?mind|changed my mind|make that|make it|i mean|"
+        r"wait(?:\s+(?:no|nah))?|nah)\b",
+        pre,
+    )[-1]
     return pre
 
 
 def _polarity_near(low: str, start: int, window: int = 28) -> int:
-    tail = TOKEN_RE.findall(_clause_before(low, start, window))[-3:]
+    # Two-token scope prevents a repair marker before an intervening replacement noun from
+    # leaking into the next attribute: "no, shoes for running" wants running, not avoids it.
+    tail = TOKEN_RE.findall(_clause_before(low, start, window))[-2:]
     return -1 if any(w in NEG_CUES for w in tail) else 1
 
 
 def _weight_near(low: str, start: int, window: int = 30) -> float:
     tokens = set(TOKEN_RE.findall(_clause_before(low, start, window)))
     return 0.5 if tokens & SOFT_CUES else 1.0
+
+
+REPAIR_CUE_RE = re.compile(
+    r"\b(?:actually|actly|wait(?:\s+(?:no|nah))?|instead|rather|scratch that|"
+    r"never ?mind|changed my mind|make that|make it|i mean|nah|but)\b",
+    re.I,
+)
+_REPAIR_BETWEEN_RE = re.compile(
+    r"\b(?:actually|actly|wait(?:\s+(?:no|nah))?|instead|rather|scratch that|"
+    r"never ?mind|changed my mind|make that|make it|i mean|nah|no|but)\b",
+    re.I,
+)
+_IMPLICIT_REJECTION_RE = re.compile(
+    r"\bwhy\b.{0,80}\b(?:instead|like|give(?:\s+me)?|giving\s+me|"
+    r"show(?:ing)?\s+me|recommend(?:ing)?\s+me|get\s+me|want|need)\b",
+    re.I,
+)
+_ADDITIVE_RE = re.compile(r"^\s*(?:,|/|\band\b|\bor\b|\+|-)+\s*$", re.I)
+_PREFERENCE_SLOT = {
+    "colour": "color", "color": "color", "material": "material", "fabric": "material",
+    "size": "size", "style": "style", "brand": "brand", "budget": "budget",
+    "category": "category", "feature": "feature", "use case": "use_case",
+}
+_SLOT_WORDS = "|".join(sorted((re.escape(k) for k in _PREFERENCE_SLOT), key=len, reverse=True))
+NO_PREFERENCE_RE = re.compile(
+    rf"(?:\b(?:i\s+)?(?:do\s+not|don'?t|dont|no\s+longer)\s+"
+    rf"(?:care|mind)(?:\s+about)?\s+(?:the\s+)?(?P<s1>{_SLOT_WORDS})\b"
+    rf"|\b(?:i\s+)?(?:do\s+not|don'?t|dont)\s+have\s+"
+    rf"(?:(?:a|an|any)\s+)?"
+    rf"preference\s+(?:for|on)\s+(?:the\s+)?(?P<s4>{_SLOT_WORDS})\b"
+    rf"|\b(?:i\s+)?(?:have\s+)?no\s+preference\s+(?:for|on)\s+(?:the\s+)?"
+    rf"(?P<s2>{_SLOT_WORDS})\b"
+    rf"|\bno\s+(?P<s5>{_SLOT_WORDS})\s+preference\b"
+    rf"|\b(?P<s6>{_SLOT_WORDS})\s+(?:does\s+not|doesn'?t|doesnt)\s+matter\b"
+    rf"|\b(?:any|whatever)\s+(?P<s3>{_SLOT_WORDS})\s+(?:is\s+)?"
+    rf"(?:fine|okay|ok|works)\b)",
+    re.I,
+)
+CLEAR_PREFERENCE_RE = re.compile(
+    rf"\b(?:clear|remove|drop|forget)\s+(?:my\s+|the\s+)?"
+    rf"(?P<slot>{_SLOT_WORDS})(?:\s+preference)?\b",
+    re.I,
+)
 
 
 class SlotFiller:
@@ -199,13 +427,39 @@ class SlotFiller:
         low = text.lower()
         out: list[Constraint] = []
 
-        def emit(slot: str, value: str, span: tuple[int, int]) -> None:
+        def emit(slot: str, value: str, span: tuple[int, int], polarity: int | None = None) -> None:
             out.append(Constraint(slot, _norm(value),
-                                  _polarity_near(low, span[0]),
-                                  _weight_near(low, span[0]), turn))
+                                  _polarity_near(low, span[0]) if polarity is None else polarity,
+                                  _weight_near(low, span[0]), turn,
+                                  span=span, surface=low[span[0]:span[1]]))
+
+        # Boundary and explicit clearing operations are first-class ledger events. Their full
+        # spans are masked from the retrieval query, while NO_PREFERENCE also suppresses re-asking.
+        for match in NO_PREFERENCE_RE.finditer(low):
+            raw_slot = next(v for v in match.groupdict().values() if v is not None)
+            out.append(Constraint(
+                _PREFERENCE_SLOT[raw_slot], "", 0, 1.0, turn,
+                operation="NO_PREFERENCE", span=match.span(), surface=match.group(0),
+            ))
+        for match in CLEAR_PREFERENCE_RE.finditer(low):
+            raw_slot = match.group("slot")
+            out.append(Constraint(
+                _PREFERENCE_SLOT[raw_slot], "", 0, 1.0, turn,
+                operation="CLEAR", span=match.span(), surface=match.group(0),
+            ))
+
+        # Feedback can reject the assistant's product type without saying "not":
+        # "why loafers ... like running shoe". Treat it as a modifier reset, not as a new
+        # loafer preference; the active category/use-case signals in the same message remain.
+        for match in _IMPLICIT_REJECTION_RE.finditer(low):
+            out.append(Constraint(
+                "__modifiers__", "", 0, 1.0, turn,
+                operation="CLEAR", span=match.span(), surface=match.group(0),
+            ))
 
         for rx, slot in ((MATERIAL_RE, "material"), (COLOR_RE, "color"),
-                         (STYLE_RE, "style"), (SIZE_RE, "size")):
+                         (STYLE_RE, "style"), (SIZE_RE, "size"),
+                         (FEATURE_RE, "feature")):
             for m in rx.finditer(low):
                 emit(slot, m.group(1), m.span())
 
@@ -226,15 +480,48 @@ class SlotFiller:
         # negated adjectives/nouns that no attribute regex caught (e.g. "not bulky")
         for m in NEG_FEATURE_RE.finditer(low):
             w = m.group(1)
-            if w in STOP_FEATURE or MATERIAL_RE.match(w) or COLOR_RE.match(w):
+            inside_meta = any(
+                event.operation in {"CLEAR", "NO_PREFERENCE"} and event.span
+                and event.span[0] <= m.start(1) < event.span[1]
+                for event in out
+            )
+            already_extracted = any(
+                event.span == m.span(1) and event.value == _norm(w) for event in out
+            )
+            if (inside_meta or already_extracted or w in STOP_FEATURE
+                    or MATERIAL_RE.match(w) or COLOR_RE.match(w) or resolve_category(w)):
                 continue
-            out.append(Constraint("feature", _norm(w), -1, 1.0, turn))
+            out.append(Constraint(
+                "feature", _norm(w), -1, 1.0, turn, operation="REMOVE",
+                span=m.span(1), surface=m.group(1),
+            ))
 
-        # category = the shopper's head noun (leftmost recognized surface form -> canonical
-        # bucket), so "roomy hobo handbag ..." grounds to `bag`, not an incidental `wallet`.
-        cat = resolve_category(low)
-        if cat:
-            out.append(Constraint("category", cat, 1, 1.0, turn))
+        # Preserve leftmost-head-noun behavior ordinarily. When category mentions are separated
+        # by an explicit repair cue, retain them all in span order so the final SET wins.
+        category_mentions = _category_matches(low)
+        # Users commonly mention the wrong recommendation while correcting the assistant
+        # ("why are you giving me snow boots?"). That noun is feedback, not a new preference.
+        category_mentions = [
+            mention for mention in category_mentions
+            if not re.search(
+                r"\b(?:why\s+(?:are|do)\s+you\s+|you\s+are\s+|"
+                r"giving\s+me\s+|showing\s+me\s+|recommend(?:ing)?\s+me\s+)"
+                r"(?:.{0,24})$",
+                low[max(0, mention[0] - 48):mention[0]],
+                re.I,
+            )
+        ]
+        selected_categories = category_mentions[:1]
+        if len(category_mentions) > 1:
+            repaired = [category_mentions[0]]
+            for previous, current in zip(category_mentions, category_mentions[1:]):
+                connector = low[previous[1]:current[0]]
+                if _REPAIR_BETWEEN_RE.search(connector):
+                    repaired.append(current)
+            if len(repaired) > 1:
+                selected_categories = repaired
+        for start, end, surface, cat in selected_categories:
+            emit("category", cat, (start, end), polarity=1)
 
         # brand via catalog vocab (longest-match), if available
         if self.vocab is not None:
@@ -242,6 +529,53 @@ class SlotFiller:
             if brand:
                 idx = low.find(brand)
                 emit("brand", brand, (idx, idx + len(brand)))
+
+        out.sort(key=lambda event: (
+            event.span[0] if event.span else len(low),
+            event.span[1] if event.span else len(low),
+        ))
+
+        # Convert extracted facts into ordered updates. Exclusive slots SET by default; an
+        # explicit conjunction permits ADD. Multi-valued slots ADD unless a repair cue says the
+        # new value replaces the earlier one. A repair connector also makes its RHS positive:
+        # "red, wait no blue" means SET blue, whereas "not red, blue" means avoid red + want blue.
+        previous_by_slot: dict[str, Constraint] = {}
+        for event in out:
+            if event.operation in {"CLEAR", "NO_PREFERENCE"}:
+                previous_by_slot.pop(event.slot, None)
+                continue
+            previous = previous_by_slot.get(event.slot)
+            connector = "" if previous is None or not previous.span or not event.span else (
+                low[previous.span[1]:event.span[0]]
+            )
+            repaired = bool(previous and _REPAIR_BETWEEN_RE.search(connector))
+            additive = bool(previous and _ADDITIVE_RE.match(connector))
+            no_as_repair = bool(re.search(r"\b(?:wait(?:\s+no)?|no|nah)\b", connector))
+            if repaired and no_as_repair and event.polarity < 0 and not re.search(
+                    r"\bnot\b", connector):
+                event.polarity = 1
+            if event.polarity < 0:
+                event.operation = "REMOVE"
+            elif previous and additive:
+                event.operation = "ADD"
+            elif event.slot in NeedModel.EXCLUSIVE_SLOTS or repaired:
+                event.operation = "SET"
+            else:
+                event.operation = "ADD"
+            previous_by_slot[event.slot] = event
+
+        # A trailing standalone "scratch that" / "never mind" clears the most recent active
+        # slot. If a replacement follows the cue, the replacement SET already expresses repair.
+        trailing = list(re.finditer(r"\b(?:scratch that|never ?mind)\b", low, re.I))
+        if trailing:
+            cue = trailing[-1]
+            has_later_fact = any(e.span and e.span[0] > cue.end() and e.value for e in out)
+            if not has_later_fact:
+                out.append(Constraint(
+                    "__last__", "", 0, 1.0, turn, operation="CLEAR",
+                    span=cue.span(), surface=cue.group(0),
+                ))
+                out.sort(key=lambda event: event.span[0] if event.span else len(low))
 
         return out
 
