@@ -4,6 +4,7 @@ __pycache__/
 .env
 results.json
 data/catalog.jsonl
+data/catalog.jsonl.gz
 data/releases/
 # Organizer-only code, private evaluation data, manifests, and build reports.
 organizer/
@@ -26,5 +27,7 @@ data/test_suite/
 traces/
 starter/agent_baseline.py
 CLAUDE.md
+EXPERIMENT_LOG.md
 .claude/
 .idea/
+EXPERIMENT_LOG.md

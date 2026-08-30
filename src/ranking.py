@@ -12,7 +12,8 @@ from src.catalog import TOKEN_RE, text, terms
 from src.config import (
     COVERAGE_FULL_PHRASE_BONUS, COVERAGE_LEN_WEIGHT, COVERAGE_POP_BLEND,
     COVERAGE_TIE_BREAK, POP_WEIGHT, PRICE_FAR_PENALTY, PRICE_LOOSE, PRICE_NEAR,
-    RRF_K, TAG_WEIGHT,
+    RRF_K, SATISFACTION_POP_CHANNEL, SATISFACTION_QUALITY_CHANNEL,
+    SATISFACTION_SEM_GATE_HIGH, SATISFACTION_SEM_GATE_LOW, TAG_WEIGHT,
 )
 
 
@@ -390,8 +391,14 @@ class NeedSatisfactionScorer:
 
     and ranks by the phrase-length-weighted mean over phrases. Coverage is exactly the special case
     that keeps only the lexical term, so on the leaky (verbatim) distribution behaviour is preserved
-    (lexical=1 dominates); the added semantic term is what survives paraphrase. No popularity re-sort:
-    a well-satisfied but unpopular target is no longer demoted.
+    (lexical=1 dominates); the added semantic term is what survives paraphrase.
+
+    Popularity is applied as an adaptive multi-channel PRIOR rather than a flat log-popularity
+    re-sort — see `_adaptive_prior`. The prior fuses two engagement channels (popularity + quality),
+    decayed by shopper specificity AND, per candidate, by the encoder's semantic confidence in that
+    candidate: an already-confident long-tail semantic match is not overwritten by a more popular
+    near-neighbour. Inspired by Walmart's Unified Supervision Framework: the prior supervises the
+    ranking only where the primary (semantic) channel is uncertain.
 
     Reuses CoverageReranker for the cached catalog text (`doc`), IDF table (`_idf`) and phrase
     tokenization (`_prepare`), so there is one canonical text/IDF source. Semantic similarity comes
@@ -401,12 +408,23 @@ class NeedSatisfactionScorer:
 
     def __init__(self, coverage: "CoverageReranker", vector=None,
                  sem_alpha: float = 1.0, pop_weight: float = 0.0,
-                 specificity_ref: int = 3) -> None:
+                 specificity_ref: int = 3,
+                 pop_channel: float = SATISFACTION_POP_CHANNEL,
+                 quality_channel: float = SATISFACTION_QUALITY_CHANNEL,
+                 sem_gate_low: float = SATISFACTION_SEM_GATE_LOW,
+                 sem_gate_high: float = SATISFACTION_SEM_GATE_HIGH) -> None:
         self._cov = coverage
         self._vector = vector
         self.sem_alpha = sem_alpha
         self.pop_weight = pop_weight
         self.specificity_ref = max(1, specificity_ref)
+        # Multi-channel prior weights (normalised to sum 1 so prior stays on [0,1]).
+        total = (pop_channel + quality_channel) or 1.0
+        self.pop_channel = pop_channel / total
+        self.quality_channel = quality_channel / total
+        # Per-candidate semantic gate thresholds. Clamped so LOW < HIGH.
+        self.sem_gate_low = max(0.0, min(sem_gate_low, sem_gate_high - 1e-6))
+        self.sem_gate_high = max(self.sem_gate_low + 1e-6, sem_gate_high)
 
     def _lexical(self, toks: list[str], catalog_text: str) -> float:
         """IDF-weighted fraction of the phrase's tokens present verbatim, in [0, 1]."""
@@ -428,32 +446,100 @@ class NeedSatisfactionScorer:
         if self._vector is not None and self.sem_alpha > 0:
             sims = self._vector.phrase_similarity_matrix([whole for _, whole in prepared], asins)
         sat: dict[str, float] = {}
+        sem_conf: dict[str, float] = {}  # per-candidate max phrase cosine — semantic confidence
         for a in asins:
             catalog_text = self._cov.doc(a)
             row = sims.get(a)
             num = den = 0.0
+            top_sem = 0.0
             for j, (toks, _whole) in enumerate(prepared):
                 lex = self._lexical(toks, catalog_text)
                 sem = max(0.0, row[j]) if row else 0.0
+                if sem > top_sem:
+                    top_sem = sem
                 match = max(lex, self.sem_alpha * sem)
                 weight = 1.0 + COVERAGE_LEN_WEIGHT * len(toks)  # longer phrase = more specific
                 num += weight * match
                 den += weight
             sat[a] = num / den if den > 0 else 0.0
+            sem_conf[a] = top_sem
         base_rank = {a: i for i, a in enumerate(asins)}
-        # Adaptive popularity prior: high when the turn is vague, fading to ~0 as the shopper gets
-        # specific, so fame breaks ties under ignorance but never buries a specifically-described
-        # long-tail target. specificity = how many distinct constraint phrases were disclosed.
+        # Adaptive multi-channel prior (Walmart Unified Supervision Framework flavour): the prior
+        # supervises the ranking only where BOTH the shopper is still vague AND the vector encoder
+        # is unsure about this specific candidate. See `_adaptive_prior` for the graded synthesis.
         ranked = sat
         if self.pop_weight > 0:
-            specificity = min(1.0, len(prepared) / self.specificity_ref)
-            w_pop = self.pop_weight * (1.0 - specificity)
-            if w_pop > 0:
-                pops = {a: self._cov._pop(a) for a in asins}
-                hi = max(pops.values()) or 1.0
-                ranked = {a: sat[a] + w_pop * (pops[a] / hi) for a in asins}
+            priors = self._adaptive_prior(asins, sem_conf, len(prepared))
+            if priors:
+                ranked = {a: sat[a] + priors[a] for a in asins}
         order = sorted(asins, key=lambda a: (-ranked[a], base_rank[a]))
         return order, sat  # return raw satisfaction as the score (belief sees true satisfaction)
+
+    # ---------------------------------------------------------------------- prior
+    def _sem_gate(self, sem_conf: float) -> float:
+        """Per-candidate popularity gate driven by the encoder's confidence in that candidate.
+
+        Returns 1.0 when the semantic channel is unreliable (`sem_conf ≤ LOW`), 0.0 when it is
+        strong (`sem_conf ≥ HIGH`), and a linear interpolation in between. This is what lets a
+        long-tail correct match survive: once the encoder is confident about it, the popularity
+        prior stops competing for its ranking slot.
+        """
+        lo, hi = self.sem_gate_low, self.sem_gate_high
+        if sem_conf >= hi:
+            return 0.0
+        if sem_conf <= lo:
+            return 1.0
+        return 1.0 - (sem_conf - lo) / (hi - lo)
+
+    def _quality(self, asin: str) -> float:
+        """Average-rating channel, mapped to [0,1] so only ≥3-star products contribute."""
+        try:
+            r = float(self._cov.catalog.get(asin, {}).get("average_rating") or 0.0)
+        except (TypeError, ValueError):
+            r = 0.0
+        return max(0.0, min(1.0, (r - 3.0) / 2.0))
+
+    def _adaptive_prior(
+        self, asins: list[str], sem_conf: dict[str, float], n_phrases: int,
+    ) -> dict[str, float]:
+        """Multi-channel engagement prior, per-candidate gated by semantic confidence.
+
+        Prior content (graded synthesis of two engagement channels, both on [0,1]):
+
+            popularity(a) = log1p(rating_number(a)) / max_pool(log1p(rating_number))
+            quality(a)    = clip((average_rating(a) − 3) / 2, 0, 1)
+            prior(a)      = POP_CHANNEL · popularity(a)  +  QUALITY_CHANNEL · quality(a)
+
+        Weight applied to that prior per candidate:
+
+            specificity   = min(1, n_phrases / specificity_ref)      # user-level decay
+            w_pop(a)      = pop_weight · (1 − specificity) · sem_gate(sem_conf(a))
+
+        Final score is `sat(a) + w_pop(a) · prior(a)`. Both terms are on [0,1] so the blend is
+        well-scaled. Rationale (Walmart USF): a supervising prior only helps where the primary
+        (semantic) channel is uncertain; anywhere the encoder is already confident, the prior is
+        silenced so it cannot bury a long-tail correct match under a more popular near-neighbour.
+        Compared to a single log(rating_number) nudge, the quality channel dampens
+        uniformly-popular-but-mediocre items even when the popularity channel would boost them.
+        """
+        if not asins:
+            return {}
+        specificity = min(1.0, n_phrases / self.specificity_ref)
+        base_w = self.pop_weight * (1.0 - specificity)
+        if base_w <= 0.0:
+            return {a: 0.0 for a in asins}
+        pop_raw = {a: self._cov._pop(a) for a in asins}
+        pop_hi = max(pop_raw.values()) or 1.0
+        priors: dict[str, float] = {}
+        for a in asins:
+            gate = self._sem_gate(sem_conf.get(a, 0.0))
+            if gate <= 0.0:
+                priors[a] = 0.0
+                continue
+            prior = (self.pop_channel * (pop_raw[a] / pop_hi)
+                     + self.quality_channel * self._quality(a))
+            priors[a] = base_w * gate * prior
+        return priors
 
 
 class Diversifier:

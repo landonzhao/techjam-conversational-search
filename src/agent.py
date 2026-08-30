@@ -19,7 +19,9 @@ from src.config import (
     COVERAGE_RETRIEVAL_WEIGHT, DIVERSITY_HEAD_KEEP, DIVERSITY_LAMBDA, EXPANSION_WEIGHT,
     LLM_RERANK_DEPTH, LLM_WEIGHT, POOL_BY_PHASE, POOL_NO_PERSONALIZATION, POOL_SIZE,
     PRICE_PROXIMITY_WEIGHT, RERANK_NEAR_TIE_MARGIN, REVEAL_CONFIDENCE, REVEAL_HOLDBACK_K,
-    SATISFACTION_POP_WEIGHT, SATISFACTION_SEM_ALPHA, SATISFACTION_SPECIFICITY_REF,
+    SATISFACTION_POP_CHANNEL, SATISFACTION_POP_WEIGHT, SATISFACTION_QUALITY_CHANNEL,
+    SATISFACTION_SEM_ALPHA, SATISFACTION_SEM_GATE_HIGH, SATISFACTION_SEM_GATE_LOW,
+    SATISFACTION_SPECIFICITY_REF,
     SEMANTIC_COVERAGE_GATE, SEMANTIC_COVERAGE_WEIGHT, SESSION_MAX_TURNS,
     SLOT_DECAY, STRUCTURED_COVERAGE_WEIGHT, USE_ADAPTIVE_CLARIFY, USE_SATISFACTION_RANKER,
 )
@@ -111,6 +113,12 @@ class Agent:
     SATISFACTION_SEM_ALPHA = SATISFACTION_SEM_ALPHA
     SATISFACTION_POP_WEIGHT = SATISFACTION_POP_WEIGHT           # Phase 2: adaptive popularity
     SATISFACTION_SPECIFICITY_REF = SATISFACTION_SPECIFICITY_REF
+    # Multi-channel prior weights (popularity / average-rating quality).
+    SATISFACTION_POP_CHANNEL = SATISFACTION_POP_CHANNEL
+    SATISFACTION_QUALITY_CHANNEL = SATISFACTION_QUALITY_CHANNEL
+    # Per-candidate semantic gate thresholds — above HIGH the popularity prior is silenced.
+    SATISFACTION_SEM_GATE_LOW = SATISFACTION_SEM_GATE_LOW
+    SATISFACTION_SEM_GATE_HIGH = SATISFACTION_SEM_GATE_HIGH
     # Fix 3 — cap the popularity term so ultra-popular lookalikes cannot bury a low-pop target.
     COVERAGE_POP_CAP = COVERAGE_POP_CAP
     # MMR diversity: freshens the list for real fashion browsing, but measured to cost
@@ -218,10 +226,10 @@ class Agent:
 
         # Alternate ranker (docs/RANKING_REDESIGN.md Phase 1): satisfaction = generalized coverage
         # with a semantic term. Shares the CoverageReranker's cached text/IDF and the vector store.
-        self._satisfaction = NeedSatisfactionScorer(
-            self._coverage, vector=self._vector, sem_alpha=self.SATISFACTION_SEM_ALPHA,
-            pop_weight=self.SATISFACTION_POP_WEIGHT,
-            specificity_ref=self.SATISFACTION_SPECIFICITY_REF)
+        # Build via refresh_satisfaction_scorer so runtime SATISFACTION_* overrides (from sweep
+        # harnesses / eval_matrix.apply_config) can rebuild the scorer without recreating the agent.
+        self._satisfaction: NeedSatisfactionScorer | None = None
+        self.refresh_satisfaction_scorer()
 
         self._cross_encoder = None
         if self.USE_CROSS_ENCODER:
@@ -254,6 +262,34 @@ class Agent:
         # with its sample_id / ground truth. See src/trace.py.
         self._tracer: Tracer = get_tracer()
         self._pending_meta: dict | None = None
+
+    # ------------------------------------------------------------------ runtime rewiring
+    def refresh_satisfaction_scorer(self) -> NeedSatisfactionScorer:
+        """(Re)build `_satisfaction` from the current SATISFACTION_* attributes.
+
+        The scorer captures its knobs into instance state at construction, so mutating
+        `agent.SATISFACTION_*` after __init__ does NOT reach the already-built scorer. Sweep
+        harnesses (eval_matrix.apply_config, sweep_satisfaction_gate, robustness) must call
+        this after any override so the new values take effect on the next `respond()`. Cheap:
+        the scorer holds only references to the shared coverage/vector components.
+        """
+        self._satisfaction = NeedSatisfactionScorer(
+            self._coverage, vector=self._vector,
+            sem_alpha=self.SATISFACTION_SEM_ALPHA,
+            pop_weight=self.SATISFACTION_POP_WEIGHT,
+            specificity_ref=self.SATISFACTION_SPECIFICITY_REF,
+            pop_channel=self.SATISFACTION_POP_CHANNEL,
+            quality_channel=self.SATISFACTION_QUALITY_CHANNEL,
+            sem_gate_low=self.SATISFACTION_SEM_GATE_LOW,
+            sem_gate_high=self.SATISFACTION_SEM_GATE_HIGH,
+        )
+        return self._satisfaction
+
+    @property
+    def satisfaction_scorer(self) -> NeedSatisfactionScorer:
+        """Public alias for the internal `_satisfaction` (used by tests / sweep scripts)."""
+        assert self._satisfaction is not None, "satisfaction scorer not initialised"
+        return self._satisfaction
 
     def reset(self, session_id: str, user_profile: dict) -> None:
         state = ConversationState(user_profile=user_profile)

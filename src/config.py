@@ -113,14 +113,35 @@ USE_SATISFACTION_RANKER: bool = False
 # Weight on the semantic-cosine term relative to the verbatim-lexical term. 1.0 = a paraphrase match
 # (cosine ~0.5) competes with a partial verbatim match; 0 = pure lexical (reproduces coverage).
 SATISFACTION_SEM_ALPHA: float = 1.0
-# Adaptive popularity (Phase 2). eval_matrix showed popularity is the dominant villain on the honest
-# set (pure coverage leak-free 0.125 -> 0.767 with popularity removed) but HELPS the leaky public set.
-# So blend popularity as a prior weighted w_pop = SATISFACTION_POP_WEIGHT * (1 - specificity), where
-# specificity rises with how much discriminating signal the shopper disclosed: fame breaks ties when
-# the turn is vague, and fades to ~0 once the need is specific (so the long-tail target is not buried).
+# Adaptive multi-channel prior (Phase 2, revised — Walmart Unified Supervision Framework style).
+# eval_matrix showed a flat log-popularity nudge is the dominant villain on the honest set (pure
+# coverage leak-free 0.125 -> 0.767 with popularity removed) yet HELPS the leaky public set: the
+# prior is only wrong when the semantic channel is already confident about a long-tail match.
+# So the prior is decayed by two factors, and its content is graded rather than a single number:
+#   w_pop(a) = SATISFACTION_POP_WEIGHT · (1 − specificity) · sem_gate(sem_conf(a))
+#   prior(a) = POP_CHANNEL · pool_norm(log1p(rating_number))  +  QUALITY_CHANNEL · norm(avg_rating)
+#   ranked(a) = satisfaction(a) + w_pop(a) · prior(a)
+# specificity rises with how many constraint phrases the shopper disclosed (user-level decay);
+# sem_gate uses the candidate's OWN max semantic cosine, so a candidate the encoder is already
+# confident about (sem_conf ≥ HIGH) never gets a popularity nudge (per-candidate decay). See
+# NeedSatisfactionScorer._adaptive_prior for the derivation.
 SATISFACTION_POP_WEIGHT: float = 0.3
 # Number of disclosed constraint phrases at which specificity saturates to 1 (popularity -> 0).
-SATISFACTION_SPECIFICITY_REF: int = 3
+# Was 3; raised to 6 after the P1.2 sweep found the leak-free set almost always discloses ≥3
+# constraints, so REF=3 was silently zeroing the prior BEFORE the per-candidate semantic gate
+# had any chance to act. Measured on 25-row subsets: REF=3 pub 0.8766, REF=6 pub 0.9128 (+0.036)
+# with no leak-free regression. See EXPERIMENT_LOG.md P1.2.
+SATISFACTION_SPECIFICITY_REF: int = 6
+# Weights of the two prior channels — must sum to 1 so prior stays on [0,1] (matches sat's scale).
+# Popularity dominates but quality dampens uniformly-popular-but-mediocre items.
+SATISFACTION_POP_CHANNEL: float = 0.7      # log(rating_number), pool-normalised
+SATISFACTION_QUALITY_CHANNEL: float = 0.3  # (average_rating − 3)/2, clipped to [0,1]
+# Per-candidate semantic gate. Cosine below LOW → full popularity (semantic is unreliable, lean on
+# the prior); above HIGH → zero popularity (trust the long-tail semantic match); linear between.
+# HIGH=0.85 is the explicit "trust semantic" cutoff — long-tail correct matches are not overwritten
+# by more popular near-neighbours once the encoder is this confident about them.
+SATISFACTION_SEM_GATE_LOW: float = 0.25
+SATISFACTION_SEM_GATE_HIGH: float = 0.65
 
 # Fix 1 — bounded demotion. RRF weight of the retrieval (dense+BM25) order fused with the verbatim
 # coverage order. When coverage cannot match reworded language it collapses to a popularity
