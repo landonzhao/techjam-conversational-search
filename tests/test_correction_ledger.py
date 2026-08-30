@@ -147,6 +147,42 @@ def test_remove_cue_rejects_an_exclusive_value():
     assert _values(need, "color", polarity=-1) == ["red"]
 
 
+def test_explicit_negation_wins_over_positive_match_in_same_turn():
+    need, _ = _parse("like instead of linen i want polyester or something")
+    assert _values(need, "material", polarity=-1) == ["linen"]
+    assert _values(need, "material") == ["polyester"]
+    assert "linen" not in [c.value for c in need.positives()]
+
+
+def test_dont_want_does_not_emit_a_positive_value_or_spurious_feature():
+    need, _ = _parse("i don't want linen, give me polyester")
+    assert _values(need, "material", polarity=-1) == ["linen"]
+    assert _values(need, "material") == ["polyester"]
+    assert "want" not in [c.value for c in need.constraints]
+
+
+def test_same_turn_llm_positive_cannot_resurrect_rejected_value():
+    need = NeedModel()
+    need.revise(SlotFiller().parse("instead of linen, polyester", turn=1))
+    need.revise([Constraint("material", "linen", turn=1, operation="ADD")])
+    assert _values(need, "material", polarity=-1) == ["linen"]
+    assert "linen" not in _values(need, "material")
+
+
+def test_rejected_value_masks_slot_and_tag_profile_preferences():
+    from src.agent import Agent
+    from src.context_engine import ProfilePreference, UserProfile
+
+    need, _ = _parse("instead of linen, polyester")
+    state = ConversationState(user_profile={"preference_tags": ["linen", "polyester"]})
+    state.need = need
+    state.profile = UserProfile("u", prefs=[
+        ProfilePreference("material", "linen", 1.0, 0.0),
+        ProfilePreference("tag", "linen", 1.0, 0.0),
+    ])
+    assert Agent._personalization_profile(state)["preference_tags"] == ["polyester"]
+
+
 def test_effective_query_strictly_excludes_superseded_terms():
     message = (
         "i am looking for a fluffy slipper oh wait actly nah a bucket better like red color "

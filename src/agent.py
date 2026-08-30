@@ -797,14 +797,36 @@ class Agent:
         for event in state.need.constraints:
             if event.active and event.polarity > 0 and event.value:
                 active.setdefault(event.slot, set()).add(event.value.casefold())
+        # Keep an explicit, slot-aware rejection projection in addition to the flattened
+        # ``excluded_terms`` view.  ProfileService may represent seed preferences as ``tag``
+        # entries (without slot metadata), while later durable preferences retain their slot;
+        # both forms must be masked for the duration of the active correction.
+        active_keys = {
+            (event.slot, event.value.casefold().strip())
+            for event in state.need.constraints
+            if event.active and event.polarity > 0 and event.value
+        }
+        rejected_keys = {
+            (event.slot, event.value.casefold().strip())
+            for event in state.need.ledger
+            if event.value and (not event.active or event.polarity <= 0)
+            and (event.slot, event.value.casefold().strip()) not in active_keys
+        }
+        rejected_values = {value for _slot, value in rejected_keys}
         if state.profile is not None:
             for pref in state.profile.prefs:
+                pref_value = pref.value.casefold().strip()
+                if pref_value in rejected_values or (
+                    (pref.slot, pref_value) in rejected_keys
+                ):
+                    tags = [tag for tag in tags if tag.casefold().strip() != pref_value]
+                    continue
                 if pref.slot in touched and pref.slot not in active:
-                    tags = [tag for tag in tags if tag.casefold().strip() != pref.value.casefold()]
+                    tags = [tag for tag in tags if tag.casefold().strip() != pref_value]
                 elif pref.slot in touched and pref.slot in active:
                     tags = [tag for tag in tags if (
-                        tag.casefold().strip() != pref.value.casefold()
-                        or pref.value.casefold() in active[pref.slot])]
+                        tag.casefold().strip() != pref_value
+                        or pref_value in active[pref.slot])]
         # Superseded values can also arrive as raw profile tags without slot metadata. Remove any
         # term explicitly retired by the ledger, including boot/hiking after a shoe correction.
         excluded = {term.casefold() for term in state.need.excluded_terms()}

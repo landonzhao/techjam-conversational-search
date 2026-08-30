@@ -223,8 +223,23 @@ class ProfileService:
         for constraint in ctx.need.positives():
             active_by_slot.setdefault(constraint.slot, set()).add(constraint.value.casefold())
         ctx_slots = ctx.need.no_preference
+        active_keys = {
+            (event.slot, event.value.casefold().strip())
+            for event in ctx.need.constraints
+            if event.active and event.polarity > 0 and event.value
+        }
+        # A seed profile preference can have the generic ``tag`` slot, so slot-based retirement
+        # alone is insufficient.  Explicitly rejected values must not be written back into the
+        # durable store in either representation; otherwise they reappear on the next session.
+        rejected_values = {
+            event.value.casefold().strip()
+            for event in ctx.need.ledger
+            if event.value and (not event.active or event.polarity <= 0)
+            and (event.slot, event.value.casefold().strip()) not in active_keys
+        }
         up.prefs = [
             pref for pref in up.prefs
+            if pref.value.casefold().strip() not in rejected_values
             if pref.slot not in touched
             or (pref.slot in active_by_slot and pref.value.casefold() in active_by_slot[pref.slot])
             or (pref.slot not in active_by_slot and pref.slot not in ctx_slots)

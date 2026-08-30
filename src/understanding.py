@@ -132,7 +132,10 @@ NEG_CUES = {"not", "no", "without", "avoid", "remove", "drop", "ditch", "skip", 
 STRONG_CUES = {"must", "need", "needs", "required", "essential", "very", "really", "definitely"}
 SOFT_CUES = {"prefer", "ideally", "maybe", "somewhat", "slightly", "kinda", "kind"}
 STOP_FEATURE = {"the", "and", "for", "with", "that", "this", "one", "any", "much", "many",
-                "them", "does", "was", "are", "but", "not", "too", "very", "really"}
+                "them", "does", "was", "are", "but", "not", "too", "very", "really",
+                # These are request verbs, not rejected product features.  Without this guard
+                # ``don't want linen`` can produce a spurious ``feature:want`` event.
+                "want", "need", "like", "prefer"}
 
 
 def _norm(value: str) -> str:
@@ -204,6 +207,35 @@ class NeedModel:
         ``constraints`` remains the backwards-compatible active view consumed by ranking;
         ``ledger`` retains every event, including superseded events, for audit and query masking.
         """
+        # A parser/LLM pair may call revise twice for one turn.  Resolve all explicit removals
+        # before applying positives so a later fallback extraction cannot resurrect a rejected
+        # value (for example ``instead of linen ... polyester``).  The same filter also handles a
+        # single extraction containing both polarity events, regardless of their order.
+        same_turn_negative: set[tuple[str, str]] = {
+            (_norm(c.slot), _norm(c.value))
+            for c in new
+            if c.value and (c.polarity < 0 or (c.operation or "").upper() == "REMOVE")
+        }
+        if new:
+            turn = new[0].turn
+            # ``turn=0`` is the backwards-compatible default used by callers that apply one
+            # operation at a time without session turn metadata.  Only consult prior ledger
+            # events when a real turn id is available; events in this `new` batch are still
+            # protected even at turn zero.
+            if turn != 0:
+                same_turn_negative.update(
+                    (_norm(old.slot), _norm(old.value))
+                    for old in self.ledger
+                    if old.turn == turn and old.value
+                    and (old.polarity < 0 or (old.operation or "").upper() == "REMOVE")
+                )
+            new = [
+                c for c in new
+                if not (c.value and c.polarity > 0
+                        and (c.operation or "").upper() != "REMOVE"
+                        and (_norm(c.slot), _norm(c.value)) in same_turn_negative)
+            ]
+
         for c in new:
             c.value = _norm(c.value)
             op = (c.operation or (
@@ -369,6 +401,30 @@ def _polarity_near(low: str, start: int, window: int = 28) -> int:
     return -1 if any(w in NEG_CUES for w in tail) else 1
 
 
+_EXPLICIT_NEGATION_BEFORE_RE = re.compile(
+    r"(?:"
+    r"(?:instead\s+of|rather\s+than)(?:\s+(?:a|an|any|the))?"
+    r"|(?:no|not|without|avoid|remove|drop|ditch|skip|exclude)"
+    r"(?:\s+(?:a|an|any|the))?"
+    r"|(?:(?:don'?t|dont|do\s+not|isn'?t|isnt|aren'?t|arent)\s+"
+    r"(?:want|need|like|prefer|care\s+about)(?:\s+(?:a|an|any))?)"
+    r")\s*$",
+    re.I,
+)
+
+
+def _explicitly_negated(low: str, start: int, window: int = 64) -> bool:
+    """Whether the value immediately follows an explicit rejection cue.
+
+    ``_clause_before`` intentionally splits on repair words such as ``instead``.  That is useful
+    for ordinary polarity scope, but it also hides the ``instead of X`` rejection from the value
+    extractor.  Check the unsplit local prefix first so the negative event wins over any positive
+    vocabulary match in the same turn.
+    """
+    prefix = low[max(0, start - window):start]
+    return bool(_EXPLICIT_NEGATION_BEFORE_RE.search(prefix))
+
+
 def _weight_near(low: str, start: int, window: int = 30) -> float:
     tokens = set(TOKEN_RE.findall(_clause_before(low, start, window)))
     return 0.5 if tokens & SOFT_CUES else 1.0
@@ -428,8 +484,14 @@ class SlotFiller:
         out: list[Constraint] = []
 
         def emit(slot: str, value: str, span: tuple[int, int], polarity: int | None = None) -> None:
+            # Explicit rejection is authoritative for the value at this span.  This check must
+            # happen before the normal local polarity heuristic, whose repair-boundary splitting
+            # would otherwise turn ``instead of linen`` into a positive ``linen`` match.
+            explicit_negative = _explicitly_negated(low, span[0])
+            resolved_polarity = -1 if explicit_negative else (
+                _polarity_near(low, span[0]) if polarity is None else polarity)
             out.append(Constraint(slot, _norm(value),
-                                  _polarity_near(low, span[0]) if polarity is None else polarity,
+                                  resolved_polarity,
                                   _weight_near(low, span[0]), turn,
                                   span=span, surface=low[span[0]:span[1]]))
 
