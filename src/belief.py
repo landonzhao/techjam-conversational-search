@@ -116,9 +116,25 @@ class BeliefModel:
 # Convergence policy
 
 def converge(belief: Belief, missing: list[str], turn: int, last_turn: int = 10) -> str:
-    """Return DELIVER, CONFIRM, or PROBE based on current belief and turn."""
+    """Return DELIVER, CONFIRM, or PROBE based on belief and remaining turn budget.
+
+    Turn-budget awareness: as the 10-turn limit approaches, lower the confidence thresholds
+    so the agent doesn't burn the last turns asking questions it can't benefit from.
+    With ≤2 turns left, deliver regardless — there's no time to refine.
+    With ≤4 turns left, confirm at lower confidence than normal.
+    """
+    remaining = last_turn - turn
     if belief.confidence >= CONVERGE_HIGH or turn >= last_turn:
         return "DELIVER"
+    # Turn-budget forcing: don't waste the final turns on clarification.
+    # Thresholds are conservative — only fire when the session is clearly running out of time
+    # AND we have at least some signal. A too-aggressive threshold locks in bad MRR.
+    if remaining <= 1:
+        return "DELIVER"  # last turn: always deliver regardless of confidence
+    if remaining <= 3 and belief.confidence >= 0.45:
+        return "DELIVER"
+    if remaining <= 4 and belief.item_confidence >= 0.38:
+        return "CONFIRM"
     if belief.item_confidence >= CONVERGE_MID and not missing:
         return "CONFIRM"
     return "PROBE"

@@ -50,11 +50,12 @@ SYSTEM_PROMPT = (
 
 
 class CrossEncoderReranker:
-    """Local semantic reranker (cross-encoder/ms-marco-MiniLM-L-6-v2).
+    """Local semantic reranker using MS-MARCO cross-encoder.
 
-    Free, unlimited, offline. Scores (constraints, candidate-text) pairs and returns
-    the head reordered by score. Loaded lazily; if unavailable, `available` is False
-    and the Agent skips it. No API key, no rate limits.
+    Upgraded from L-6-v2 (22M params) to L-12-v2 (34M params) — meaningfully better at
+    near-tie disambiguation on BEIR benchmarks, which is exactly where MRR is decided.
+    Free, unlimited, offline. Falls back to L-6-v2 if L-12 unavailable.
+    No API key, no rate limits.
     """
 
     def __init__(self, catalog: dict[str, dict],

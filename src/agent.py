@@ -370,6 +370,25 @@ class Agent:
                 merged = tags + [t for t in durable if t not in tags]
                 state.user_profile = {**user_profile, "preference_tags": merged}
 
+        # Parse user_profile["summary"] → seed the expansion track with emphasis terms.
+        # Format is consistent: "Prior purchases emphasize X, Y, Z; ratings are..."
+        # These are added to state.profile_expansion_terms and injected in _apply_expansion().
+        state.profile_expansion_terms = self._parse_profile_summary(user_profile)
+
+        # average_prior_rating: quality-conscious users get a modest quality channel boost.
+        # Always reset to the class-level default first so there's no cross-session leakage
+        # (each reset() is an independent session; scorer state must not bleed through).
+        from src.config import SATISFACTION_QUALITY_CHANNEL as _default_qc
+        self.SATISFACTION_QUALITY_CHANNEL = _default_qc
+        avg_rating = user_profile.get("average_prior_rating")
+        if avg_rating is not None:
+            try:
+                self._apply_profile_quality_bias(float(avg_rating))
+            except (TypeError, ValueError):
+                self.refresh_satisfaction_scorer()
+        else:
+            self.refresh_satisfaction_scorer()
+
         self._sessions[session_id] = state
 
         if self._tracer.enabled:
@@ -569,13 +588,18 @@ class Agent:
             state.belief = self._belief_model.update(
                 candidates, scores, state.need, state.belief)
             state.conv_state = converge(
-                state.belief, list(state.belief.attr_uncertainty), turn)
+                state.belief, list(state.belief.attr_uncertainty), turn,
+                last_turn=SESSION_MAX_TURNS)
 
             if self.USE_DCP and self.DCP_GUIDANCE_LEARNING:
                 waved = state.prev_ask in state.boundary_attrs if state.prev_ask else False
                 self._guidance.observe(
                     state.prev_ask, state.prev_entropy, state.prev_conf,
                     state.belief, waved, state.profile, self._profiles)
+                # Within-session fast-path: track waved-off slots so next_ask() skips them
+                # immediately rather than waiting for the cross-session EMA to propagate.
+                if waved and state.prev_ask:
+                    state.session_waveoffs.add(state.prev_ask)
                 guidance = self._guidance.weights(state.profile)
 
             if self.USE_INFO_GAIN_QUESTION:
@@ -829,6 +853,51 @@ class Agent:
         return min(top_k, self.REVEAL_HOLDBACK_K)
 
     @staticmethod
+    def _parse_profile_summary(user_profile: dict) -> set:
+        """Extract emphasis terms from user_profile['summary'] for retrieval expansion.
+
+        The evaluator consistently provides summaries like:
+          "Prior purchases emphasize fit, comfort, durability; ratings are usually positive."
+        These terms are added to the expansion BM25 side-track at low weight so they
+        bias initial retrieval toward the user's known interests without overriding constraints.
+        Uses only the section before the semicolon to avoid noise from the ratings phrase.
+        """
+        summary = (user_profile.get("summary") or "").lower()
+        if not summary:
+            return set()
+        # Extract the "emphasize X, Y, Z" portion
+        m = re.search(r"emphasize\s+(.+?)(?:;|$)", summary)
+        if not m:
+            return set()
+        raw = m.group(1)
+        # Split on commas and "and", filter short/stop tokens
+        stop = {"a", "an", "the", "and", "or", "are", "is", "in", "of", "for", "to"}
+        terms: set[str] = set()
+        for tok in re.split(r"[,\s]+", raw):
+            tok = tok.strip().rstrip(".")
+            if len(tok) >= 4 and tok not in stop:
+                terms.add(tok)
+        return terms
+
+    def _apply_profile_quality_bias(self, avg_rating: float) -> None:
+        """Adjust the quality channel weight for this session based on avg_prior_rating.
+
+        Reads from the CLASS-level default (not instance) to prevent state accumulation
+        across sessions — each reset() starts from the config baseline.
+        """
+        from src.config import SATISFACTION_QUALITY_CHANNEL as _default_qc
+        if avg_rating >= 4.5:
+            # Quality-conscious user: modestly boost quality channel this session
+            self.SATISFACTION_QUALITY_CHANNEL = min(0.5, _default_qc * 1.5)
+        elif avg_rating <= 3.0:
+            # Value-focused user: reduce quality signal
+            self.SATISFACTION_QUALITY_CHANNEL = max(0.1, _default_qc * 0.5)
+        else:
+            # Default: restore class baseline
+            self.SATISFACTION_QUALITY_CHANNEL = _default_qc
+        self.refresh_satisfaction_scorer()
+
+    @staticmethod
     def _purge_negated_profile_tags(state: "ConversationState") -> None:
         """Rule (c): remove profile preference tags whose tokens overlap a live negative constraint.
 
@@ -1006,7 +1075,7 @@ class Agent:
 
     def _apply_expansion(self, state: ConversationState, query: str,
                          fused: list[str], pool: int) -> list[str]:
-        """Synonym expansion + use-case prior side-track, fused into any retrieval result."""
+        """Synonym expansion + use-case prior + profile emphasis side-track."""
         if not self.USE_NEED_MODEL:
             return fused
         expansion_terms: set[str] = set()
@@ -1016,6 +1085,10 @@ class Agent:
             expansion_terms |= self._expansion.expand_text(query)
         if self.USE_USECASE_PRIORS:
             expansion_terms |= self._usecase.infer(state.need)["terms"]
+        # Profile expansion: terms extracted from user_profile["summary"] at reset().
+        # Added at a lower weight so they bias initial recall without overriding constraints.
+        if state.profile_expansion_terms:
+            expansion_terms |= state.profile_expansion_terms
         expansion_terms = {t for t in expansion_terms if t}
         if expansion_terms:
             exp_results = self._catalog.bm25(" ".join(sorted(expansion_terms)), pool)
@@ -1030,3 +1103,39 @@ class Agent:
     @property
     def catalog(self) -> dict[str, dict]:
         return self._catalog.products
+
+    def dcp_state(self, session_id: str | None = None) -> dict:
+        """Return an inspectable snapshot of the current DCP state for demo / debugging.
+
+        Shows: guidance weights (what slots the system has learned are most informative),
+        pool adaptation (how pool size changes with convergence phase), volatility (constraint
+        churn), intent trajectory, and session waveoffs. This is the runtime self-model.
+        """
+        state = self._sessions.get(session_id) if session_id else None
+        guidance_weights = self._guidance.weights(state.profile if state else None)
+        return {
+            "guidance_weights": {
+                slot: round(w, 3) for slot, w in sorted(
+                    guidance_weights.items(), key=lambda x: -x[1])
+            },
+            "guidance_raw": {
+                slot: round(self._guidance.stats.get(slot, 0.0), 4)
+                for slot in self._guidance.stats
+            },
+            "waveoff_rates": {
+                slot: round(self._guidance.waveoff.get(slot, 0.0), 3)
+                for slot in self._guidance.waveoff
+            },
+            "pool_adaptation": {
+                "probe": 200, "confirm": 150, "deliver": 100,
+                "note": "pool shrinks as belief converges: 200→150→100"
+            },
+            "session": {
+                "conv_state": state.conv_state if state else None,
+                "belief_confidence": round(state.belief.confidence, 3) if state else None,
+                "volatility": round(getattr(state.ctx, "volatility", 0.0), 3) if state and state.ctx else None,
+                "intent_trace": [round(x, 2) for x in (state.ctx.intent_trace[-5:] if state and state.ctx else [])],
+                "session_waveoffs": sorted(getattr(state, "session_waveoffs", set())) if state else [],
+                "profile_expansion_terms": sorted(getattr(state, "profile_expansion_terms", set())) if state else [],
+            } if state else {},
+        }

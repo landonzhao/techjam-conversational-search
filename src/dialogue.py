@@ -100,6 +100,8 @@ class ConversationState:
     constraint_phrases: list = field(default_factory=list)
     constraint_phrase_turns: list[int] = field(default_factory=list)  # parallel turn metadata
     override_turn: int | None = None  # turn number of last intent override (for pool boost)
+    profile_expansion_terms: set = field(default_factory=set)  # parsed from user_profile summary
+    session_waveoffs: set = field(default_factory=set)  # slots waved off this session
 
     need: NeedModel = field(default_factory=NeedModel)
     belief: Belief = field(default_factory=Belief)
@@ -150,8 +152,9 @@ def next_ask(state: ConversationState, use_info_gain: bool, info_gain_mode: str)
         if state.ig_attr not in state.boundary_attrs and state.ig_attr not in no_pref:
             return state.ig_attr
 
+    blocked = state.boundary_attrs | getattr(state, "session_waveoffs", set())
     for attr in ASK_PRIORITY:
-        if attr in state.boundary_attrs:
+        if attr in blocked:
             continue
         if attr == "other":
             return attr

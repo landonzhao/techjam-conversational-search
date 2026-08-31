@@ -285,24 +285,57 @@ class OrchestrationPolicy:
     def plan(self, ctx: SessionContext, buying_score: float, conv_state: str,
              ask_slot: str | None, warm: bool) -> ExecutionPlan:
         dense = self.DENSE_BROWSING + buying_score * (self.DENSE_BUYING - self.DENSE_BROWSING)
-        if conv_state == "DELIVER":
+
+        # --- Volatility adaptation ---
+        # High volatility means the user is actively revising preferences. Don't rush to CONFIRM
+        # or DELIVER — stay in PROBE mode and widen the pool to see fresh candidates.
+        effective_state = conv_state
+        if ctx.volatility > 0.45 and conv_state == "CONFIRM":
+            effective_state = "PROBE"
+
+        # --- Intent trajectory: detect momentum ---
+        # A rising buying_score over the last 3 turns signals the user is converging on a purchase.
+        # An oscillating score signals confusion — keep exploring.
+        trajectory = "flat"
+        if len(ctx.intent_trace) >= 3:
+            recent = ctx.intent_trace[-3:]
+            delta = recent[-1] - recent[0]
+            std = (sum((x - sum(recent) / 3) ** 2 for x in recent) / 3) ** 0.5
+            if delta > 0.15 and std < 0.12:
+                trajectory = "rising"
+            elif std > 0.15:
+                trajectory = "oscillating"
+
+        # Rising + already PROBE → accelerate to CONFIRM one turn early
+        if trajectory == "rising" and effective_state == "PROBE" and buying_score >= 0.55:
+            effective_state = "CONFIRM"
+        # Oscillating → stay in PROBE regardless of conv_state
+        if trajectory == "oscillating" and effective_state == "CONFIRM":
+            effective_state = "PROBE"
+
+        if effective_state == "DELIVER":
             pool = self.POOL_DELIVER
             rerank_stack = ["satisfaction", "cross_encoder"]
-        elif conv_state == "CONFIRM":
+        elif effective_state == "CONFIRM":
             pool = self.POOL_CONFIRM
             rerank_stack = ["satisfaction", "cross_encoder"]
         else:
             pool = self.POOL_PROBE
             rerank_stack = ["personalization", "satisfaction"]
-        if warm and conv_state == "PROBE":
+            # High volatility → expand pool further to surface fresh candidates
+            if ctx.volatility > 0.45:
+                pool = min(pool + 50, 250)
+
+        if warm and effective_state == "PROBE":
             pool = min(pool, 150)
+
         weights = {"dense": dense, "expansion": self.EXPANSION_WEIGHT}
         return ExecutionPlan(
             routes=["bm25", "dense", "expansion"],
             route_weights=weights,
             pool_size=pool,
             rerank_stack=rerank_stack,
-            dialogue_action=conv_state,
+            dialogue_action=effective_state,
             ask_slot=ask_slot,
         )
 
