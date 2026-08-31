@@ -29,14 +29,18 @@ import argparse
 import json
 import random
 import re
-from collections import defaultdict
+import sys
+from collections import Counter, defaultdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evaluator.local_evaluator import catalog_index, coarse_category, intent_card, searchable_text
 from evaluator.robustness import (
     COLOR_PARAPHRASE, FEATURE_PARAPHRASE, MATERIAL_PARAPHRASE, USECASE_PARAPHRASE, _verify_disjoint,
 )
 from src.understanding import COLOR_RE, MATERIAL_RE, USE_CASE_KEYS
+from scripts.scenario_mix import assert_official_mix, scenario_schedule
 
 _WORD = re.compile(r"[a-z0-9]+")
 # generic template words that are not discriminating signal (excluded from the leak check)
@@ -171,7 +175,7 @@ def main() -> None:
     cats = list(by_cat)
     rng.shuffle(cats)
 
-    scenarios = (["buying"] * 40 + ["browsing"] * 35 + ["intent_override"] * 15 + ["boundary"] * 10)
+    scenarios = scenario_schedule(args.n, args.seed)
     sessions: list[dict] = []
     leak_ours: list[float] = []
     leak_leaky: list[float] = []
@@ -197,7 +201,7 @@ def main() -> None:
             continue
         seen.add(target)
 
-        scenario = scenarios[len(sessions) % len(scenarios)]
+        scenario = scenarios[len(sessions)]
         behavior: dict = {"scenario_type": scenario}
         if scenario == "intent_override":
             behavior["override"] = {
@@ -225,15 +229,19 @@ def main() -> None:
         leak_leaky.append(leak_rate(
             leaky["hard_constraints"] + leaky["soft_preferences"], blob_tokens))
 
+    if len(sessions) != args.n:
+        raise RuntimeError(
+            f"could only build {len(sessions)} of {args.n} requested sessions; "
+            "refusing to write a mis-sized evaluation set")
+    assert_official_mix([s["scenario_type"] for s in sessions], args.n)
+
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8") as fh:
         for s in sessions:
             fh.write(json.dumps(s, ensure_ascii=False) + "\n")
 
-    scen = defaultdict(int)
-    for s in sessions:
-        scen[s["scenario_type"]] += 1
+    scen = Counter(s["scenario_type"] for s in sessions)
     mean = lambda xs: sum(xs) / len(xs) if xs else 0.0
     print(f"wrote {len(sessions)} sessions -> {out}")
     print(f"distinct categories covered: {len({s['category_bucket'] for s in sessions})}")

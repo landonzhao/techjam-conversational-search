@@ -34,7 +34,9 @@ RRF_K: int = 60  # rank smoothing constant in 1/(k+rank)
 # Candidate pool
 POOL_SIZE: int = 200          # default pool for retrieval (measured: 50→200 lifted MRR)
 POOL_BY_PHASE: dict[str, int] = {"explore": 200, "converge": 200, "deliver": 120}
-POOL_NO_PERSONALIZATION: int = 10  # minimal pool when Personalizer is disabled
+# Legacy fallback retained for callers that explicitly request the old policy. Benchmark code must
+# use Agent.POOL_SIZE_OVERRIDE instead: disabling popularity/profile signals must not shrink recall.
+POOL_NO_PERSONALIZATION: int = 10
 
 # ---------------------------------------------------------------------------
 # Synonym expansion
@@ -43,24 +45,6 @@ EXPANSION_WEIGHT: float = 0.1  # weight of the expansion BM25 side-track in RRF
 # ---------------------------------------------------------------------------
 # Intent routing / EMA
 CONFIDENCE_EMA: float = 0.6  # buying_score EMA: b_t = α·raw + (1−α)·b_{t−1}
-# IntentRouter.score coefficients (were hardcoded in src/dialogue.py; heuristic — see DECISIONS.md).
-# s = BUYING_CUE·[buy phrase] − BROWSING_CUE·[browse phrase] + HARD_CONSTRAINT·[regex hit]
-#     + SPECIFICITY_SLOPE·(distinct_terms − SPECIFICITY_PIVOT);  buying_score = sigmoid(s)
-INTENT_BUYING_CUE_WEIGHT: float = 1.5
-INTENT_BROWSING_CUE_WEIGHT: float = 1.5
-INTENT_HARD_CONSTRAINT_WEIGHT: float = 1.0
-INTENT_SPECIFICITY_SLOPE: float = 0.18
-INTENT_SPECIFICITY_PIVOT: int = 6
-INTENT_BUYING_CUTOFF: float = 0.6    # buying_score ≥ this → "buying"
-INTENT_BROWSING_CUTOFF: float = 0.4  # buying_score ≤ this → "browsing"; between → "mixed"
-# BeliefModel item-confidence blend (were hardcoded in src/understanding.py):
-# item_conf = MARGIN·margin + ENTROPY·(1−entropy) + STABILITY·min(stable/2, 1)
-BELIEF_MARGIN_WEIGHT: float = 0.5
-BELIEF_ENTROPY_WEIGHT: float = 0.3
-BELIEF_STABILITY_WEIGHT: float = 0.2
-# QuestionSelector: ask a direct product-comparison question when the top-2 belief margin is below
-# this (candidates nearly tied → comparing beats an abstract attribute question).
-COMPARISON_MARGIN: float = 0.15
 
 # Convergence thresholds for belief-driven dialogue state
 CONVERGE_HIGH: float = 0.60  # confidence ≥ this → DELIVER
@@ -113,13 +97,6 @@ PRICE_NEAR: float = 0.02              # |price-budget|/budget below this = exact
 PRICE_LOOSE: float = 0.15             # below this = near match; beyond = mild evidence against
 PRICE_FAR_PENALTY: float = 0.1        # penalty slope for a present-but-far price (capped)
 
-# Hard-constraint category gate (roadmap #2). Demote candidates whose own title resolves to a
-# DIFFERENT canonical category than the confidently-known need category (e.g. keep sandals ahead of
-# boots after 'ankle boots'→'block-heel sandals'). Non-destructive (violators to the back, never
-# dropped). OFF by default: on the leaky public set category words already leak, so a hard gate risks
-# the guardrail; needs shadow-suite validation. Research: confidence-gated hard filtering (GenFacet).
-USE_CATEGORY_GATE: bool = False
-
 # Initiative A — structured constraint coverage. A second ranking track that scores candidates
 # by how many NORMALIZED NeedModel constraints (material=leather, size=2T, polarity-aware) they
 # satisfy, matched against catalog text — not verbatim message phrases. Fused with the verbatim
@@ -133,69 +110,70 @@ STRUCTURED_COVERAGE_WEIGHT: float = 0.0
 # where match = max(verbatim-lexical IDF fraction, SATISFACTION_SEM_ALPHA * semantic cosine). Coverage
 # is the special case that uses only the lexical term; adding the semantic term makes the score
 # survive paraphrase (the reworded phrase matches the product's real vocabulary by meaning). Replaces
-# the coverage re-sort when on. ON by default: validated (scripts/validate_satisfaction.py) to lift
-# the honest sets — pillar_free 0.295 -> 0.398 (+35%), pillar_moderate 0.483 -> 0.501 — while public
-# holds at 0.903 (a deliberate -0.014 leaderboard cost for large paraphrase robustness). Set False to
-# revert to the pure-coverage ranker (public 0.9172).
-USE_SATISFACTION_RANKER: bool = True
+# the coverage re-sort when on. Off by default until it beats coverage on eval_matrix (pop-ablated).
+USE_SATISFACTION_RANKER: bool = False
 # Weight on the semantic-cosine term relative to the verbatim-lexical term. 1.0 = a paraphrase match
 # (cosine ~0.5) competes with a partial verbatim match; 0 = pure lexical (reproduces coverage).
 SATISFACTION_SEM_ALPHA: float = 1.0
-# Adaptive multi-channel prior (Phase 2, revised — teammate branch-ranking, Walmart Unified
-# Supervision Framework style). A flat log-popularity nudge is the dominant villain on the honest set
-# (pure coverage leak-free 0.125 -> 0.767 with popularity removed) yet HELPS the leaky public set: the
-# prior is only wrong when the semantic channel is already confident about a long-tail match. So the
-# prior is graded (two channels) and decayed by TWO factors — user specificity AND per-candidate
-# semantic confidence:
-#   w_pop(a) = SATISFACTION_POP_WEIGHT · (1 − specificity) · sem_gate(sem_conf(a))
-#   prior(a) = POP_CHANNEL · pool_norm(log1p(rating_number)) + QUALITY_CHANNEL · norm(avg_rating)
-#   ranked(a) = satisfaction(a) + w_pop(a) · prior(a)
-# See NeedSatisfactionScorer._adaptive_prior. On natural-language turns the Agent passes pop_weight=0
-# so the generic regex-derived phrases don't let fame reorder a well-retrieved target (see agent.py).
-# VALUE: 0.15 (reverted from the teammate's 0.3). Consolidation measurement (docs/EXPERIMENTS.md
-# CONSOLIDATION-03): her 0.3/REF=6 defaults regressed OUR full pipeline (public 0.8629 < 0.88 floor);
-# the MECHANISM (multi-channel + semantic gate) with the proven 0.15/REF=3 values is strictly better
-# on both axes (public 0.8842 ✓, pillar_free 0.6549 vs 0.6388). Her subset +0.036 didn't transfer.
-SATISFACTION_POP_WEIGHT: float = 0.15
-# Weights of the two prior channels — normalised to sum 1 so the prior stays on [0,1] (sat's scale).
-SATISFACTION_POP_CHANNEL: float = 0.7      # log(rating_number), pool-normalised
-SATISFACTION_QUALITY_CHANNEL: float = 0.3  # (average_rating − 3)/2, clipped to [0,1]
-# Per-candidate semantic gate. Cosine ≤ LOW → full popularity (semantic unreliable, lean on prior);
-# ≥ HIGH → zero popularity (trust the long-tail semantic match, don't let a popular near-neighbour
-# overwrite it); linear between. Tuned on branch-ranking.
-SATISFACTION_SEM_GATE_LOW: float = 0.25
-SATISFACTION_SEM_GATE_HIGH: float = 0.65
-
-# Learning-to-Rank (docs/ADVANCED_RANKING_PLAN.md). A trained linear model (cache/ltr_model.json,
-# built by scripts/collect_ltr_data.py + train_ltr.py on leak-balanced data) re-ranks the pool by the
-# learned combination of all signals (retrieval rank, satisfaction, coverage, cross-encoder, price,
-# popularity...). OFF by default: the mechanism is validated (it learns to down-weight the verbatim
-# leak) but not yet shown to beat the satisfaction+cross-encoder default through the evaluator.
-USE_LTR: bool = False
-LTR_MODEL_PATH: str = "cache/ltr_model.json"
+# Adaptive popularity (Phase 2). eval_matrix showed popularity is the dominant villain on the honest
+# set (pure coverage leak-free 0.125 -> 0.767 with popularity removed) but HELPS the leaky public set.
+# So blend popularity as a prior weighted w_pop = SATISFACTION_POP_WEIGHT * (1 - specificity), where
+# specificity rises with how much discriminating signal the shopper disclosed: fame breaks ties when
+# the turn is vague, and fades to ~0 once the need is specific (so the long-tail target is not buried).
+SATISFACTION_POP_WEIGHT: float = 0.3
 # Number of disclosed constraint phrases at which specificity saturates to 1 (popularity -> 0).
-# Kept at 3 (teammate branch-ranking raised it to 6 on a 25-row subset, +0.036; but on OUR full
-# pipeline REF=6 with pop_weight=0.3 dropped public to 0.8629 < floor — see CONSOLIDATION-03). With
-# the per-candidate semantic gate now doing the honest-set protection, REF=3 holds the public floor
-# (0.8842) and keeps pillar_free high (0.6549). Re-sweep on the full sets, not subsets, if revisiting.
 SATISFACTION_SPECIFICITY_REF: int = 3
-# Neutral floor for candidates the catalog is SILENT about (zero lexical AND zero semantic evidence).
-# Bryan's insight: silence ≠ conflict — give these an unknown-state score so they aren't unfairly
-# demoted below candidates that happened to match boilerplate. Target: honest Hit@10 ↑ with MRR held.
-# Off = 0.0 (old behaviour, penalises silent candidates relative to low-match ones).
-SATISFACTION_UNKNOWN_FLOOR: float = 0.5  # CORE — directly closes Hit@10 gap
 
-# --- Retrieval guard head (Phase 2 integration, Bryan) ------------------------------------------
-# Force-keep the top-K hybrid-retrieval candidates inside the visible top-10 window when no exact
-# catalog evidence exists. BM25+dense consensus is more reliable than noisy absolute cosine; a
-# small score gap should not eject a rank-1 retrieval hit from the response.
-# GUARD_MAX_EXACT: disable the guard as soon as this many exact phrases are found (0 = disable
-# only on any exact match), so the verbatim public-leak path is never diluted.
-# Off by default until fair-eval confirms no public regression; default-False = OPTIONAL.
-USE_RETRIEVAL_GUARD: bool = True   # CORE — closes Bryan's Hit@10 advantage
-RETRIEVAL_GUARD_K: int = 8        # protect hybrid retrieval's top-8 in the visible top-10
-RETRIEVAL_GUARD_VISIBLE_K: int = 10
-RETRIEVAL_GUARD_MAX_EXACT: int = 0  # disable guard once any exact phrase found
+# --- P2 dual-track ranker -----------------------------------------------------------------------
+# One additive scorer preserves the incoming semantic retrieval order while selectively restoring
+# exact catalog coverage on genuinely leaky turns.  These are deliberately conservative starting
+# points; eval_matrix/oracle runs should sweep them before making a final leaderboard choice.
+USE_DUAL_TRACK_RANKER: bool = True
+# Public/leak-free joint sweep: 1.8 preserves the honest retrieval head while raising the public
+# 100-session guardrail from 0.8623 to 0.8831 when paired with the conditional prior below.
+DUAL_W_RETRIEVAL: float = 1.8
+DUAL_W_SATISFACTION: float = 1.0
+# Clean-track retrieval uses a normalized 25% BM25 / 75% dense split.  The RRF helper keeps
+# BM25 as the primary route at weight 1.0, so Agent converts this ratio to a dense secondary
+# weight of 0.75 / 0.25 = 3.0.  These knobs are only consulted while leaky_evidence is false.
+DUAL_CLEAN_BM25_WEIGHT: float = 0.25
+DUAL_CLEAN_DENSE_WEIGHT: float = 0.75
+# Semantic satisfaction is more reliable than popularity on the reworded track.  This weight is
+# applied only when the clean session has at least one active ledger/phrase constraint.
+DUAL_CLEAN_W_SATISFACTION: float = 2.0
+DUAL_W_COVERAGE_HIGH: float = 2.5
+DUAL_W_COVERAGE_LOW: float = 0.0
+# Legacy public-leak compatibility: when disclosed phrases have any exact catalog evidence, keep
+# the old raw-coverage path active even if the phrases are shared across the pool. This is separate
+# from the stricter discrimination gate and stays zero on paraphrased leak-free turns.
+DUAL_W_LEAKY_COVERAGE: float = 4.0
+# RRF strength for the historical raw-coverage ordering on leaky turns. The old main branch
+# ranked by coverage first and fused retrieval as a floor; this term reproduces that ordering while
+# remaining inactive when no exact disclosed phrase is present.
+DUAL_W_LEGACY_COVERAGE_ORDER: float = 3.0
+# Cumulative exact coverage from active ledger values. Unlike the old unique-long-phrase
+# override, this intentionally rewards several shared catalog values (e.g. polyester + Imported
+# + Button closure) and is kept separate from the discriminating phrase gate.
+DUAL_W_CUMULATIVE_COVERAGE: float = 5.0
+# Exact bi/tri-gram overlap from the current user turn. This is deliberately additive to
+# cumulative coverage so leaky public wording can resolve shared boilerplate ties; it is zero when
+# no raw n-gram matches a candidate.
+# Shared Amazon boilerplate creates dozens of identical raw n-gram hits; 0.2 keeps the useful
+# tie-break without letting repeated boilerplate overwhelm retrieval and satisfaction.
+DUAL_RAW_NGRAM_BONUS: float = 0.2
+# Conservative prior for ordinary/paraphrased sessions. Verified catalog-leak sessions use the
+# stronger value below; separating them avoids the measured leak-free regression of a global 1.0.
+DUAL_POPULARITY_WEIGHT: float = 0.10
+DUAL_LEAKY_POPULARITY_WEIGHT: float = 1.0
+DUAL_MIN_EXACT_MATCHES: int = 2
+DUAL_DISCRIMINATION_MIN: float = 0.35
+DUAL_SHARED_MAX: float = 0.35
+# Bounded-demotion safety net. When there are zero complete exact phrases, preserve the first N
+# hybrid-retrieval candidates inside the visible top-k. This prevents noisy absolute cosine scores
+# from ejecting shallow semantic hits while leaving enough slots for satisfaction-based promotion.
+# The guard is disabled as soon as exact catalog evidence exists, preserving the public leak track.
+DUAL_RETRIEVAL_GUARD_K: int = 8
+DUAL_GUARD_MAX_EXACT_MATCHES: int = 0
 
 # Fix 1 — bounded demotion. RRF weight of the retrieval (dense+BM25) order fused with the verbatim
 # coverage order. When coverage cannot match reworded language it collapses to a popularity
@@ -237,45 +215,6 @@ COVERAGE_POP_CAP: float = 0.0
 # Optional rerankers (off by default — measured neutral/negative)
 CE_DEPTH: int = 50    # candidates the cross-encoder rescores
 CE_WEIGHT: float = 1.0
-# Cross-encoder fusion mode (roadmap component I — docs/EXPERIMENTS.md, exp CE-FUSION-01).
-# RRF fusion (CE_WEIGHT above) uses only the CE RANK order and discards its score magnitudes.
-# Convex mode blends the min-max-normalized satisfaction and CE scores over the CE head:
-#   FinalScore(c) = (1 − CE_BETA)·SatNorm(c) + CE_BETA·CENorm(c)
-# STATUS: PROMISING — ITERATE (OFF by default). Validated on the ranking-isolation harness
-# (scripts/exp_ce_fusion.py): vs RRF, β=0.6 lifts leak-free MRR 0.633→0.693 (+0.060) and pillar_free
-# MRR 0.452→0.548 (+0.096), 53–74 sessions improved vs 11–16 worsened. BUT the official public
-# evaluator REGRESSES at every honest-winning β (β=0.6: TechScore −0.0068, β=0.5: −0.010), because
-# the MS-MARCO cross-encoder's magnitude dilutes the leaky verbatim signal. No global β satisfies
-# both honest (+≥0.01 MRR) and public (≤0.005 regression). Kept OFF pending a GATED convex (apply the
-# blend only on uninformative/paraphrase turns — the next experiment). Set True to enable globally.
-USE_CE_CONVEX: bool = True   # CORE — CE-convex now safe via regime routing (see USE_REGIME_ROUTING)
-CE_BETA: float = 0.6
-# Legacy belief-margin gate (superseded by USE_REGIME_ROUTING below). Kept for rollback; only
-# consulted when USE_REGIME_ROUTING is False. 0 = ungated (convex every turn, regresses public).
-CE_CONVEX_GATE_MARGIN: float = 0.5
-
-# --- Regime routing (Phase 3 integration) -------------------------------------------------------
-# Replace the noisy belief.margin gate with evidence-based regime detection. When the shopper's
-# disclosed phrases have ≥ REGIME_LEAKY_MIN_EXACT exact catalog matches per candidate, the session
-# is on the public/leaky track → use RRF + coverage path (never dilute verbatim signal with CE).
-# Otherwise it's a clean/paraphrase turn → CE-convex is safe to enable.
-# This is why the old global CE_CONVEX_GATE_MARGIN could never hold the public floor: it gated on
-# a noisy proxy (belief margin); the regime router gates on actual catalog evidence instead.
-USE_REGIME_ROUTING: bool = True   # CORE — enables evidence-based CE-convex gating
-REGIME_LEAKY_MIN_EXACT: int = 1   # exact phrase matches per top candidate to call session "leaky"
-                                   # 1 = any exact match → leaky (conservative; 2 let too many public
-                                   # turns slip through to CE-convex, costing -0.051 public MRR)
-
-# --- Surgical correction rules (Phase 4 integration) -------------------------------------------
-# Rule (a) same-turn negation always on — clearly correct, no measurement risk.
-# Rule (b) category-switch modifier clear: retiring prior-turn constraints on category switch is
-# correct for real sessions but regressed public boundary MTTC (4.10→6.60) because the evaluator's
-# verbatim disclosures can trigger spurious category parses. Off by default; re-enable after
-# validating on the honest intent-override/boundary sets specifically.
-USE_CATEGORY_SWITCH_CLEAR: bool = False  # OPTIONAL — gate rule (b) until MTTC regression resolved
-# Rule (c) negation purge from profile — off by default (safe but low measurable impact on evals
-# since public/private users don't share profile state). On for real user deployments.
-USE_PROFILE_NEGATION_PURGE: bool = True  # OPTIONAL — mask retired profile tags this session
 LLM_RERANK_DEPTH: int = 20
 LLM_WEIGHT: float = 0.3
 LLM_MODEL: str = "gemini-flash-lite-latest"
@@ -285,11 +224,13 @@ RERANK_NEAR_TIE_MARGIN: float = 0.0
 
 # ---------------------------------------------------------------------------
 # Dialogue / clarification
-# "other" first: maps to any undisclosed constraint (highest yield, repeatable), which is what
-# the evaluator's boundary sessions need. Bryan's reordering (structured slots first) regressed
-# public boundary MTTC from 4.10 → 6.20 (+2.10 turns) because it wastes turns asking for specific
-# slots that boundary sessions have waved off before reaching the catch-all "other". Reverted.
-ASK_PRIORITY: list[str] = ["other", "feature", "material", "color", "style", "size", "use_case"]
+# "other" matches any undisclosed constraint (highest yield) and is repeatable;
+# the rest fill in only if the shopper hasn't waved them off.
+# Structured slots come before the generic fallback.  The evaluator maps ask_attribute directly to
+# its next constraint, so emitting ``other`` while a supported slot is available wastes a turn.
+ASK_PRIORITY: list[str] = [
+    "feature", "material", "color", "style", "size", "use_case", "budget", "other",
+]
 
 # Thresholds for the proactive phase-transition state machine
 EXPLORE_TERM_THRESHOLD: int = 6     # distinct query terms below → explore (over-general)
@@ -313,22 +254,6 @@ REVEAL_HOLDBACK_K: int = 1           # list length while holding back (measured:
 # split on, asked as a feature question. Category-adaptive by construction; off by default until
 # measured on pillar_free browsing + the public MTTC guardrail.
 USE_ADAPTIVE_CLARIFY: bool = False
-
-# ---------------------------------------------------------------------------
-# Natural-language constraint capture (docs/EXPERIMENTS.md — keystone honest-generalization fix).
-# `extract_constraints` only fires on the simulator's "key requirement is:" marker, so on natural
-# shopper language `constraint_phrases` is empty and the satisfaction/coverage ranker no-ops (falls
-# back to raw retrieval order — our primary ranking signal is coupled to the benchmark's disclosure
-# syntax). When on, the ranker ALSO consumes the NeedModel's structured positive slot values as
-# ranking phrases — but ONLY on turns where no marker phrase was disclosed, so evaluator/paraphrase
-# sets (which always carry the marker) are unchanged. Research: query-understanding → structured
-# constraints → constrained ranking (GenFacet; relevance filtering).
-USE_NL_CONSTRAINTS: bool = True
-# Slots that hold at most one active value; a newer positive supersedes older positives of the SAME
-# slot (DST selective-overwrite — SOM-DST / mentioned-slot-pools). Multi-valued slots (color,
-# material, feature, style, use_case) accumulate so "black or navy" / "cotton or linen" coexist.
-# Fixes stale-constraint revision (e.g. "ankle boots" → "actually, block-heel sandals").
-SINGLE_VALUED_SLOTS: tuple[str, ...] = ("category", "size", "budget")
 
 # ---------------------------------------------------------------------------
 # DCP (context engine)

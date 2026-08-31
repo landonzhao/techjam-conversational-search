@@ -158,22 +158,23 @@ class UserProfile:
 
 
 class ProfileService:
-    """Persistent, time-decaying per-user preference store (cache/profiles.json).
+    """Time-decaying per-user preference store with an explicit persistence switch.
 
     Keyed by a hash of the anonymized profile; in offline evaluation each session is fresh,
-    so write-through never feeds a subsequent session's read.
+    so benchmark callers should set ``persistent=False`` and use an ephemeral path.
     """
 
     EMA = 0.6              # write-through blend of durable weight toward the new session
     HALFLIFE_DAYS = 45.0   # decay applied at read time
     PRUNE_EPS = 0.05
 
-    def __init__(self, path: str | None = None) -> None:
+    def __init__(self, path: str | None = None, persistent: bool = True) -> None:
         from src.config import PROFILE_STORE
         path = path or PROFILE_STORE
         self.path = Path(path)
+        self.persistent = persistent
         self._store: dict[str, dict] = {}
-        if self.path.exists():
+        if self.persistent and self.path.exists():
             try:
                 self._store = json.loads(self.path.read_text(encoding="utf-8"))
             except Exception:
@@ -214,6 +215,35 @@ class ProfileService:
         """Merge the distilled session's positive constraints into durable prefs (EMA +
         recency), update category affinity, then persist (best-effort)."""
         now = time.time()
+        # A slot touched by the current session is authoritative. Retire durable values that are
+        # no longer active before merging, so a corrected boot/hiking preference cannot reappear on
+        # the next reset for the same user. Multi-valued slots retain only explicitly active values.
+        touched = {event.slot for event in ctx.need.ledger if event.slot != "__last__"}
+        active_by_slot: dict[str, set[str]] = {}
+        for constraint in ctx.need.positives():
+            active_by_slot.setdefault(constraint.slot, set()).add(constraint.value.casefold())
+        ctx_slots = ctx.need.no_preference
+        active_keys = {
+            (event.slot, event.value.casefold().strip())
+            for event in ctx.need.constraints
+            if event.active and event.polarity > 0 and event.value
+        }
+        # A seed profile preference can have the generic ``tag`` slot, so slot-based retirement
+        # alone is insufficient.  Explicitly rejected values must not be written back into the
+        # durable store in either representation; otherwise they reappear on the next session.
+        rejected_values = {
+            event.value.casefold().strip()
+            for event in ctx.need.ledger
+            if event.value and (not event.active or event.polarity <= 0)
+            and (event.slot, event.value.casefold().strip()) not in active_keys
+        }
+        up.prefs = [
+            pref for pref in up.prefs
+            if pref.value.casefold().strip() not in rejected_values
+            if pref.slot not in touched
+            or (pref.slot in active_by_slot and pref.value.casefold() in active_by_slot[pref.slot])
+            or (pref.slot not in active_by_slot and pref.slot not in ctx_slots)
+        ]
         index = {(p.slot, p.value): p for p in up.prefs}
         for c in ctx.need.positives():
             if c.slot == "category":
@@ -237,6 +267,8 @@ class ProfileService:
         self._store[up.user_id] = up.as_dict()
 
     def _flush(self) -> None:
+        if not self.persistent:
+            return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(json.dumps(self._store), encoding="utf-8")
@@ -299,13 +331,14 @@ class GuidanceLearner:
     LAMBDA = 0.5  # guidance multiplier strength
     EMA = 0.3     # online update rate
 
-    def __init__(self, path: str | None = None) -> None:
+    def __init__(self, path: str | None = None, persistent: bool = True) -> None:
         from src.config import GUIDANCE_STORE
         path = path or GUIDANCE_STORE
         self.path = Path(path)
+        self.persistent = persistent
         self.stats: dict[str, float] = {}
         self.waveoff: dict[str, float] = {}
-        if self.path.exists():
+        if self.persistent and self.path.exists():
             try:
                 d = json.loads(self.path.read_text(encoding="utf-8"))
                 self.stats = dict(d.get("stats", {}))
@@ -346,6 +379,8 @@ class GuidanceLearner:
         return out
 
     def _flush(self) -> None:
+        if not self.persistent:
+            return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(

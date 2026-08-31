@@ -153,6 +153,7 @@ _VALID_SLOTS = [
     "material", "color", "size", "style", "use_case",
     "budget", "feature", "category", "brand",
 ]
+_VALID_OPERATIONS = ["SET", "ADD", "REMOVE", "CLEAR", "NO_PREFERENCE"]
 _SLOT_RESPONSE_SCHEMA = {
     "type": "array",
     "items": {
@@ -160,9 +161,10 @@ _SLOT_RESPONSE_SCHEMA = {
         "properties": {
             "slot": {"type": "string", "enum": _VALID_SLOTS},
             "value": {"type": "string"},
-            "polarity": {"type": "integer"},  # +1 want / -1 avoid (validated in _parse)
+            "polarity": {"type": "integer", "enum": [-1, 0, 1]},
+            "operation": {"type": "string", "enum": _VALID_OPERATIONS},
         },
-        "required": ["slot", "value", "polarity"],
+        "required": ["slot", "value", "polarity", "operation"],
     },
 }
 
@@ -201,7 +203,7 @@ class LLMSlotExtractor:
         known_slots: dict[str, str] | None = None,
         category: str | None = None,
     ) -> list[dict]:
-        """Return NEW/CHANGED {slot, value, polarity} constraints from `message`, read in the
+        """Return ordered preference updates from `message`, read in the
         context of the conversation so far, the slots already known, and the product category.
 
         Returns [] on failure — callers treat this as "no additional constraints found".
@@ -257,6 +259,7 @@ class LLMSlotExtractor:
             if not isinstance(data, list):
                 return []
             valid_slots = set(_VALID_SLOTS)
+            valid_operations = set(_VALID_OPERATIONS)
             out = []
             for item in data:
                 if not isinstance(item, dict):
@@ -264,8 +267,19 @@ class LLMSlotExtractor:
                 slot = str(item.get("slot", "")).strip()
                 value = str(item.get("value", "")).strip().lower()
                 polarity = int(item.get("polarity", 1))
-                if slot in valid_slots and value and polarity in (1, -1):
-                    out.append({"slot": slot, "value": value, "polarity": polarity})
+                operation = str(item.get("operation", "")).strip().upper()
+                # Backwards compatibility for entries created before the ledger schema.
+                if not operation:
+                    operation = "REMOVE" if polarity < 0 else "SET"
+                value_ok = bool(value) or operation in {"CLEAR", "NO_PREFERENCE"}
+                polarity_ok = polarity in (1, -1) or (
+                    polarity == 0 and operation in {"CLEAR", "NO_PREFERENCE"})
+                if (slot in valid_slots and operation in valid_operations
+                        and value_ok and polarity_ok):
+                    out.append({
+                        "slot": slot, "value": value, "polarity": polarity,
+                        "operation": operation,
+                    })
             return out
         except Exception:
             return []

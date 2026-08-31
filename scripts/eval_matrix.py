@@ -6,7 +6,7 @@ One command prints a matrix of {ranking config} x {normal, popularity-ablated} o
   - synthetic  (data/synthetic_set.jsonl)         DIAGNOSTIC — harder leaky cases
 
 Two things the plan (docs/STRENGTHENING_PLAN.md P0.2) needs and ad-hoc exp_* scripts don't give:
-  1. POP-ABLATED mode (USE_PERSONALIZATION off, COVERAGE_POP_BLEND=0, tie-break=base): if a config's
+  1. POP-ABLATED mode (popularity terms zeroed, profile handling and pool unchanged): if a config's
      score survives with popularity removed, it ranks on RELEVANCE, not fame. This is the P1 baseline.
   2. RANKING ORACLE (--oracle): best achievable score if the target, whenever it is anywhere in the
      retrieved pool, were ranked #1. Separates "retrieval never found it" (unfixable by ranking) from
@@ -22,22 +22,29 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import src.ranking as ranking_mod
 from evaluator.local_evaluator import catalog_index, evaluate, load_jsonl
+from scripts.eval_support import new_isolated_agent
 from src.agent import Agent
 
 CATALOG = "data/catalog.jsonl"
 
 # Named ranking configs, each a dict of agent attributes to set. Unset floor/gate attrs default off.
 CONFIGS = {
-    "no-floor (pure coverage)": dict(COVERAGE_INFORMATIVE_MIN=0.0, COVERAGE_RETRIEVAL_WEIGHT=0.0,
-                                     SUPPRESS_POP_ON_PARAPHRASE=False, USE_SATISFACTION_RANKER=False),
-    "disc gate + suppress":     dict(COVERAGE_INFORMATIVE_MIN=0.5, COVERAGE_RETRIEVAL_WEIGHT=2.0,
-                                     COVERAGE_DISCRIMINATION_PCTL=0.9, SUPPRESS_POP_ON_PARAPHRASE=True,
-                                     USE_SATISFACTION_RANKER=False),
-    "satisfaction (Phase 1)":   dict(USE_SATISFACTION_RANKER=True),   # the ranker rebuild
+#    "no-floor (pure coverage)": dict(COVERAGE_INFORMATIVE_MIN=0.0, COVERAGE_RETRIEVAL_WEIGHT=0.0,
+#                                     SUPPRESS_POP_ON_PARAPHRASE=False, USE_SATISFACTION_RANKER=False,
+#                                     USE_DUAL_TRACK_RANKER=False),
+#    "disc gate + suppress":     dict(COVERAGE_INFORMATIVE_MIN=0.5, COVERAGE_RETRIEVAL_WEIGHT=2.0,
+#                                     COVERAGE_DISCRIMINATION_PCTL=0.9, SUPPRESS_POP_ON_PARAPHRASE=True,
+#                                     USE_SATISFACTION_RANKER=False, USE_DUAL_TRACK_RANKER=False),
+#    "satisfaction (Phase 1)":   dict(USE_SATISFACTION_RANKER=True, USE_DUAL_TRACK_RANKER=False),
+    "dual-track (P2)":          dict(USE_DUAL_TRACK_RANKER=True),
 }
 
 # (label, path, default sample size or None for full)
@@ -45,6 +52,8 @@ SETS = [
     ("leak-free", "data/language_stress_set.jsonl", None),   # primary — always full
     ("public",    "data/public_set.jsonl",          100),    # guardrail — sampled unless --public-n
 ]
+if Path("data/synthetic_set.jsonl").exists():
+    SETS.append(("synthetic", "data/synthetic_set.jsonl", 1000))
 
 
 def apply_config(agent: Agent, cfg: dict) -> None:
@@ -54,21 +63,36 @@ def apply_config(agent: Agent, cfg: dict) -> None:
     agent.COVERAGE_DISCRIMINATION_PCTL = 0.9
     agent.SUPPRESS_POP_ON_PARAPHRASE = False
     agent.USE_SATISFACTION_RANKER = False
+    agent.USE_DUAL_TRACK_RANKER = False
     for k, v in cfg.items():
         setattr(agent, k, v)
 
 
 def set_pop_ablation(agent: Agent, ablate: bool) -> None:
-    """Remove every popularity signal on the scored path so the score reflects relevance alone."""
+    """Remove popularity while preserving profile handling and candidate-pool size."""
     if ablate:
-        agent._pop_saved = (agent.USE_PERSONALIZATION, agent.COVERAGE_POP_BLEND,
-                            ranking_mod.COVERAGE_TIE_BREAK)
-        agent.USE_PERSONALIZATION = False
+        agent._pop_saved = {
+            "coverage_blend": agent.COVERAGE_POP_BLEND,
+            "ranking_pop_weight": ranking_mod.POP_WEIGHT,
+            "tie_break": ranking_mod.COVERAGE_TIE_BREAK,
+            "satisfaction_pop_weight": agent._satisfaction.pop_weight,
+            "dual_popularity_weight": agent.DUAL_POPULARITY_WEIGHT,
+            "dual_leaky_popularity_weight": agent.DUAL_LEAKY_POPULARITY_WEIGHT,
+        }
         agent.COVERAGE_POP_BLEND = 0.0
-        ranking_mod.COVERAGE_TIE_BREAK = "base"   # module-level tie-break -> retrieval order
+        ranking_mod.POP_WEIGHT = 0.0
+        ranking_mod.COVERAGE_TIE_BREAK = "base"   # tie-break -> incoming retrieval order
+        agent._satisfaction.pop_weight = 0.0
+        agent.DUAL_POPULARITY_WEIGHT = 0.0
+        agent.DUAL_LEAKY_POPULARITY_WEIGHT = 0.0
     elif hasattr(agent, "_pop_saved"):
-        agent.USE_PERSONALIZATION, agent.COVERAGE_POP_BLEND, ranking_mod.COVERAGE_TIE_BREAK = \
-            agent._pop_saved
+        saved = agent._pop_saved
+        agent.COVERAGE_POP_BLEND = saved["coverage_blend"]
+        ranking_mod.POP_WEIGHT = saved["ranking_pop_weight"]
+        ranking_mod.COVERAGE_TIE_BREAK = saved["tie_break"]
+        agent._satisfaction.pop_weight = saved["satisfaction_pop_weight"]
+        agent.DUAL_POPULARITY_WEIGHT = saved["dual_popularity_weight"]
+        agent.DUAL_LEAKY_POPULARITY_WEIGHT = saved["dual_leaky_popularity_weight"]
 
 
 def score_row(agent: Agent, rows: list, cat_ids, cats, prods) -> tuple:
@@ -81,6 +105,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--public-n", type=int, default=None, help="public guardrail sample size")
     ap.add_argument("--synth-n", type=int, default=None, help="synthetic diagnostic sample size")
+    ap.add_argument("--pool-size", type=int, default=200,
+                    help="candidate pool size for every mode/config (default: 200)")
     ap.add_argument("--oracle", action="store_true", help="add retrieval/ranking headroom row")
     args = ap.parse_args()
 
@@ -96,9 +122,9 @@ def main() -> None:
     Agent.USE_LLM_INFERENCE = False
     Agent.USE_LLM_RESPONSE = False
     Agent.USE_LLM_RERANK = False
-    agent = Agent(CATALOG)
+    agent = new_isolated_agent(CATALOG, pool_size=args.pool_size)
 
-    print("EVAL MATRIX — score / hit@10 / mrr  (leak-free=PRIMARY, public=GUARDRAIL ref 0.9297)",
+    print(f"EVAL MATRIX — score / hit@10 / mrr  (leak-free=PRIMARY, public=GUARDRAIL; pool={args.pool_size})",
           flush=True)
     for mode in ("normal", "pop-ablated"):
         set_pop_ablation(agent, mode == "pop-ablated")

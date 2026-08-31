@@ -18,8 +18,12 @@ from __future__ import annotations
 
 import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evaluator.local_evaluator import catalog_index, evaluate, load_jsonl
+from scripts.eval_support import new_isolated_agent
 from src.agent import Agent
 
 TIER = sys.argv[1] if len(sys.argv) > 1 else "hard"
@@ -39,7 +43,7 @@ def run() -> None:
     Agent.USE_LLM_RERANK = False
     Agent.USE_CROSS_ENCODER = False
     Agent.USE_LLM_SLOTS = True
-    agent = Agent(CATALOG)
+    agent = new_isolated_agent(CATALOG)
     extractor = agent._slot_extractor  # keep a handle so the OFF arm can null it
 
     arms = [

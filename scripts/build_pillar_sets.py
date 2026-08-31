@@ -25,8 +25,11 @@ import argparse
 import json
 import random
 import re
-from collections import defaultdict
+import sys
+from collections import Counter, defaultdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evaluator.local_evaluator import (
     catalog_index, classify_constraint, coarse_category, intent_card, searchable_text,
@@ -35,9 +38,7 @@ from evaluator.robustness import _verify_disjoint
 from scripts.build_language_stress_set import (
     _ANCHOR_TEMPLATES, _RELATIVE, _TEMPLATES, _content_tokens, discriminator, paraphrasable_attrs,
 )
-
-# official scenario mix (40/40/15/5), expanded to whole sessions
-SCENARIOS = ["buying"] * 40 + ["browsing"] * 40 + ["intent_override"] * 15 + ["boundary"] * 5
+from scripts.scenario_mix import assert_official_mix, scenario_schedule
 
 
 def verbatim_phrase(slot: str, product: dict) -> str | None:
@@ -95,6 +96,7 @@ def main() -> None:
     cats = list(by_cat)
     rng.shuffle(cats)
 
+    scenarios = scenario_schedule(args.n, args.seed)
     sessions: list[dict] = []
     leak_by_pillar: dict[str, list[float]] = defaultdict(list)
     seen: set[str] = set()
@@ -116,7 +118,7 @@ def main() -> None:
             continue
         seen.add(target)
         anchor_phrase = rng.choice(_ANCHOR_TEMPLATES).format(d=anchor)
-        scenario = SCENARIOS[len(sessions) % len(SCENARIOS)]
+        scenario = scenarios[len(sessions)]
 
         # per-pillar shaping of hard vs soft (what is disclosed vs what must be clarified)
         behavior: dict = {"scenario_type": scenario}
@@ -150,14 +152,18 @@ def main() -> None:
         toks = set().union(*(_content_tokens(p) for p in attr_only)) if attr_only else set()
         leak_by_pillar[scenario].append(len(toks & blob_tokens) / max(1, len(toks)))
 
+    if len(sessions) != args.n:
+        raise RuntimeError(
+            f"could only build {len(sessions)} of {args.n} requested sessions; "
+            "refusing to write a mis-sized evaluation set")
+    assert_official_mix([s["scenario_type"] for s in sessions], args.n)
+
     out = Path(f"data/pillar_{args.leak}.jsonl")
     with out.open("w", encoding="utf-8") as fh:
         for s in sessions:
             fh.write(json.dumps(s, ensure_ascii=False) + "\n")
 
-    counts = defaultdict(int)
-    for s in sessions:
-        counts[s["scenario_type"]] += 1
+    counts = Counter(s["scenario_type"] for s in sessions)
     mean = lambda xs: sum(xs) / len(xs) if xs else 0.0
     print(f"wrote {len(sessions)} sessions -> {out}  (leak={args.leak})")
     print(f"distinct categories: {len({s['category_bucket'] for s in sessions})}")

@@ -11,18 +11,25 @@ at the bot's SEARCH POOL (the ~200 candidates retrieval pulls, before ranking). 
     - target WAS in the pool  -> RANKING's fault  (found it, ranked it away — recoverable headroom)
     - target NOT in the pool  -> RETRIEVAL/understanding's fault (never found — a different fix)
 
-Ranking config = disc gate + suppress (our best), so "misses" are the residual after best ranking.
+Ranking config = the current default (P2 dual-track), so "misses" are the residual after the active
+submission ranking path. Runtime exceptions are reported separately from retrieval/ranking faults.
 
 Usage:  python -u scripts/oracle_leakfree.py
 """
 from __future__ import annotations
 
 import statistics
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evaluator.local_evaluator import (
     MAX_TURNS, TOP_K, catalog_index, coarse_category, customer_reply, initial_message,
     load_jsonl, materialize_hidden_fields, normalize_recommendations,
 )
+from scripts.eval_support import new_isolated_agent
 from src.agent import Agent
 
 CATALOG = "data/catalog.jsonl"
@@ -37,8 +44,8 @@ def main() -> None:
     Agent.USE_LLM_INFERENCE = False
     Agent.USE_LLM_RESPONSE = False
     Agent.USE_LLM_RERANK = False
-    agent = Agent(CATALOG)
-    # best ranking config, so residual misses are true headroom (retrieval is unaffected by these)
+    agent = new_isolated_agent(CATALOG)
+    # Legacy coverage knobs are retained for comparison; P2 is the current default path.
     agent.COVERAGE_RETRIEVAL_WEIGHT = 2.0
     agent.COVERAGE_INFORMATIVE_MIN = 0.5
     agent.COVERAGE_DISCRIMINATION_PCTL = 0.9
@@ -56,6 +63,8 @@ def main() -> None:
     agent._retrieve = wrapped
 
     n = hits = in_pool_ever = miss_in_pool = miss_not_in_pool = 0
+    runtime_error_sessions = runtime_errors = 0
+    error_types: Counter[str] = Counter()
     best_ranks_on_miss: list[int] = []
     pool_sizes: list[int] = []
 
@@ -72,12 +81,16 @@ def main() -> None:
         user_message = initial_message(es, coarse_category(cats.get(target, [])), disclosed)
 
         hit = False
+        session_errored = False
         target_in_pool = False
         best_rank: int | None = None
         for turn in range(1, MAX_TURNS + 1):
             try:
                 response = agent.respond(sid, user_message, turn, TOP_K)
-            except Exception:
+            except Exception as exc:
+                session_errored = True
+                runtime_errors += 1
+                error_types[type(exc).__name__] += 1
                 response = {"message": "", "ask_attribute": None, "recommendations": []}
             poolids = captured["pool"]
             pool_sizes.append(len(poolids))
@@ -106,6 +119,11 @@ def main() -> None:
             in_pool_ever += 1
         if hit:
             hits += 1
+        elif session_errored:
+            # Do not call a swallowed agent exception a ranking fault merely because retrieval had
+            # already found the target. The official evaluator still scores it as a miss, but this
+            # diagnostic must expose the actual subsystem responsible.
+            runtime_error_sessions += 1
         elif target_in_pool:
             miss_in_pool += 1
             if best_rank is not None:
@@ -123,6 +141,9 @@ def main() -> None:
     print(f"end-to-end HIT@10 (best ranking):        {hits}/{n}  = {pct(hits,n):.1f}%", flush=True)
     print("-" * 68, flush=True)
     print(f"MISSES: {misses}", flush=True)
+    print(f"  AGENT runtime errors:                  {runtime_error_sessions}/{misses} = "
+          f"{pct(runtime_error_sessions,misses):.1f}%  of misses "
+          f"({runtime_errors} failed turns; {dict(error_types)})", flush=True)
     print(f"  RANKING's fault  (in pool, ranked away): {miss_in_pool}/{misses} = "
           f"{pct(miss_in_pool,misses):.1f}%  of misses", flush=True)
     print(f"  RETRIEVAL's fault (never in pool):       {miss_not_in_pool}/{misses} = "
