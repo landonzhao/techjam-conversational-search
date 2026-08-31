@@ -559,7 +559,11 @@ class SatisfactionScorerTest(unittest.TestCase):
 
 
 class OverrideRetrievalQueryTest(unittest.TestCase):
-    """ConversationState.retrieval_query() isolates post-override messages."""
+    """ConversationState.retrieval_query() — currently delegates to query_text().
+
+    The seam exists for a future NeedModel-driven query construction that avoids
+    the category-loss problem caused by raw text slicing on override sessions.
+    """
 
     def _state(self):
         from src.dialogue import ConversationState
@@ -570,32 +574,21 @@ class OverrideRetrievalQueryTest(unittest.TestCase):
         s.all_text = ["I need a jacket", "make it waterproof"]
         self.assertEqual(s.retrieval_query(), "I need a jacket make it waterproof")
 
-    def test_override_skips_override_phrase_uses_post_override_content(self):
-        # Override on turn 3: all_text=[t1, t2, override_phrase, t4_new_constraint]
-        # retrieval_query should use all_text[3:] = [t4_new_constraint] only
+    def test_override_still_returns_full_history(self):
+        # retrieval_query() returns full history even after an override;
+        # slicing was reverted because it caused category-loss (target dropped from pool).
         s = self._state()
-        s.all_text = ["I need a jacket", "blue please",
-                      "actually forget that", "show me boots for hiking"]
-        s.override_turn = 3  # override_turn=3 → slice at index 3
+        s.all_text = ["I need a jacket", "blue please", "actually show me boots"]
+        s.override_turn = 3
         query = s.retrieval_query()
+        self.assertIn("jacket", query)   # full history preserved
         self.assertIn("boots", query)
-        self.assertNotIn("jacket", query)
-        self.assertNotIn("actually forget", query)  # override phrase excluded
 
-    def test_override_turn_on_same_turn_falls_back_to_full_history(self):
-        # On the override turn itself, no post-override content yet → full history
-        s = self._state()
-        s.all_text = ["I need a jacket", "blue please", "actually forget that"]
-        s.override_turn = 3  # all_text[3:] = [] → falls back
-        self.assertIn("jacket", s.retrieval_query())  # full history used
-
-    def test_query_text_unchanged_after_override(self):
-        # query_text() must still return full history (used for slot extraction, LLM)
+    def test_query_text_equals_retrieval_query(self):
         s = self._state()
         s.all_text = ["I need a jacket", "blue", "actually show me boots"]
         s.override_turn = 3
-        self.assertIn("jacket", s.query_text())
-        self.assertIn("boots", s.query_text())
+        self.assertEqual(s.query_text(), s.retrieval_query())
 
 
 class ProfileRankingFallbackTest(unittest.TestCase):

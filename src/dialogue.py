@@ -124,26 +124,18 @@ class ConversationState:
         return " ".join(self.all_text)
 
     def retrieval_query(self) -> str:
-        """Query string for retrieval — post-override slice when meaningful content exists.
+        """Query string used for retrieval.
 
-        After an intent override, the pre-override messages contaminate dense retrieval with
-        the old category's vocabulary. However, the override message itself is often content-free
-        (e.g. "Actually, please ignore my earlier preference."), so the slice only activates on
-        the turn AFTER the override — once the first post-override constraint has arrived.
+        Currently identical to query_text() (full conversation history). A post-override
+        retrieval slice was attempted (skipping pre-override turns after an intent override)
+        but was found to cause a category loss problem: when only the new constraint phrase
+        is used, BM25 searches across all categories and misses the target product.
 
-        Indexing:
-          override_turn=N (1-indexed), all_text is 0-indexed.
-          The override message is at all_text[N-1].
-          Post-override content starts at all_text[N] (index N, 0-based).
-          We wait until len(all_text) > N so at least one constraint-bearing message exists.
-
-        Preserves query_text() (full history) for slot extraction, LLM context, and the
-        override turn itself.
+        The correct fix is NeedModel-driven query construction (using state.need.positives()
+        to build a structured query) rather than raw text slicing. That approach requires
+        a coordinated change to the BM25 query builder and is deferred to a future iteration.
+        The method is retained as a seam for that future improvement.
         """
-        if self.override_turn is not None:
-            post_override = self.all_text[self.override_turn:]  # skip the override phrase itself
-            if post_override:  # at least one message after the override turn
-                return " ".join(post_override)
         return self.query_text()
 
 

@@ -1033,8 +1033,7 @@ class Agent:
         query = state.retrieval_query()
 
         if self._tracer.enabled:
-            self._tracer.stage("retrieval", query=query, intent=intent,
-                               post_override=(state.override_turn is not None))
+            self._tracer.stage("retrieval", query=query, intent=intent)
 
         if not query.strip():
             return self._catalog.bm25(query, pool)
@@ -1084,16 +1083,9 @@ class Agent:
         """
         if not (self.USE_VECTOR and self._vector):
             return self._catalog.bm25(query, pool)
-        # Use retrieval_query() text list for decayed search so post-override retrieval
-        # is anchored to the new intent, not the old category's vocabulary.
-        retrieval_text = (
-            state.all_text[state.override_turn:]
-            if state.override_turn is not None and len(state.all_text) > state.override_turn
-            else state.all_text
-        )
         try:
             if SLOT_DECAY < 1.0:
-                dense_results = self._vector.search_decayed(retrieval_text, pool, SLOT_DECAY)
+                dense_results = self._vector.search_decayed(state.all_text, pool, SLOT_DECAY)
             else:
                 dense_results = self._vector.search(query, pool)
         except Exception:
@@ -1121,14 +1113,9 @@ class Agent:
         else:
             w = vector_weight(state.buying_score, self.USE_INTENT_ROUTING,
                               self.USE_CONFIDENCE_ROUTING)
-        retrieval_text = (
-            state.all_text[state.override_turn:]
-            if state.override_turn is not None and len(state.all_text) > state.override_turn
-            else state.all_text
-        )
         try:
             if SLOT_DECAY < 1.0:
-                dense_results = self._vector.search_decayed(retrieval_text, pool, SLOT_DECAY)
+                dense_results = self._vector.search_decayed(state.all_text, pool, SLOT_DECAY)
             else:
                 dense_results = self._vector.search(query, pool)
         except Exception:
