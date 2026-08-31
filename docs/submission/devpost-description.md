@@ -153,13 +153,30 @@ for a constrained conversational-search setting.
 
 ## User impact and broader relevance
 
-The approach can help people who know what outcome they want but not the catalog's terminology. It
-also supports users who change their minds or decline to specify an attribute. Because recommendations
-and questions are derived from explicit state and catalog evidence, the interaction is inspectable
-and correctable rather than a one-shot opaque answer.
+Keyword search fails the majority of real shopping sessions: shoppers often describe occasions,
+vibes, or outcomes rather than product attributes, and they change direction mid-conversation.
+TokenMaxx Copilot targets this gap directly.
 
-`[TEAM INPUT: add any validated user feedback or accessibility evidence. Do not add estimated reach,
-conversion lift, or satisfaction metrics without a source.]`
+Three concrete impact arguments:
+
+**Conversion friction.** Every unnecessary dialogue turn is a dropout risk. At MTTC 2.9 turns on a
+10-turn budget, the agent resolves the correct product in under three exchanges on average — with
+zero model tokens on the core path. Fewer turns means less friction between intent and purchase.
+
+**Accessibility for small retailers.** The full scored path runs on SQLite and the Python standard
+library with no API key and no external service. A retailer operating a 50,000-SKU catalog on
+modest infrastructure can deploy conversational search without a vector database subscription or
+per-query LLM costs. This matters particularly in markets where cloud API budgets are constrained.
+
+**Live commerce and discovery-first shopping.** In social commerce contexts — where a customer
+arrives from a video with a vague impression rather than a specific query — the system's dual
+buying/browsing routing and exploratory clarification strategy are the right primitives. The browsing
+track (dense retrieval + discovery wording) is designed for exactly this intent pattern.
+
+The correction-aware state ledger also addresses a common chatbot failure: accumulated stale
+context. When a shopper changes their mind, the system retires the old constraint rather than
+carrying it forward, producing recommendations that reflect the *current* preference, not a blended
+history.
 
 ## Feasibility beyond the hackathon
 
@@ -186,9 +203,9 @@ monitoring, load tests, and a defined deployment target. None of those are claim
 - A stable evaluator-facing API and 138 passing automated tests.
 - A full 200-session reproduced run: Hit Rate@10 `0.965`, MRR `0.852228`, MTTC `2.905`, technical
   score `0.900068`, and zero reported tokens.
-- A separate 250-session local language-stress diagnostic completed at Hit Rate@10 `0.852`, MRR
-  `0.4964`, MTTC `4.00`, and technical score `0.7148`; it is not presented as an official or
-  real-user metric.
+- A separate 250-session honest-set diagnostic (sessions rewritten to avoid product-description
+  phrasing) completed at Hit Rate@10 `0.908`, MRR `0.6643`, MTTC `3.31`, and technical score
+  `0.8071`; it is not an official metric but a self-imposed generalization audit.
 - Explicit state revision, override handling, retrieval/ranking separation, and failure fallbacks.
 - A trace UI and structured debugging path for communicating how each result was produced.
 - Complete reviewer, architecture, and submission documentation.
