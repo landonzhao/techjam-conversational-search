@@ -62,7 +62,7 @@ message + profile
 
 **State** is maintained as an explicit constraint ledger — not a raw transcript. Every preference is stored with its polarity, turn, and weight. On intent override, old constraints are soft-demoted rather than evicted, because the evaluator constructs messages partly from the target's soft preferences — keeping a partial signal helps.
 
-**Ranking** scores candidates by how well their catalog text covers the active constraint phrases. A cross-encoder fires only on turns where the verbatim signal is weak (detected via a regime router that counts exact phrase matches), providing high-precision reranking where it is actually needed without diluting the lexical signal where it is strong.
+**Ranking** scores candidates by how well their catalog text covers the active constraint phrases. A local cross-encoder (`ms-marco-MiniLM-L-6-v2`) runs by default and is gated by a regime router: on turns where exact phrase matches are strong, the lexical coverage signal takes precedence; on turns where it is weak, the cross-encoder provides high-precision reranking. This prevents the cross-encoder from diluting the verbatim signal when it is already decisive.
 
 **Self-evolution** is implemented via the `GuidanceLearner`: it measures the entropy drop in the belief model after each clarification question and reweights future question priorities with an exponential moving average. Dormant in offline evaluation (each session resets), active in a live deployment.
 
