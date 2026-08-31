@@ -215,9 +215,9 @@ monitoring, load tests, and a defined deployment target. None of those are claim
 
 ## Links
 
-- Repository: `[REPOSITORY_URL]`
-- Setup guide: `[REPOSITORY_URL]#setup`
-- Architecture: `[REPOSITORY_URL]/blob/main/architecture.md`
+- Repository: `https://github.com/landonzhao/techjam-conversational-search`
+- Setup guide: `https://github.com/landonzhao/techjam-conversational-search#setup`
+- Architecture: `https://github.com/landonzhao/techjam-conversational-search/blob/main/architecture.md`
 - Public YouTube demo: `[PUBLIC_YOUTUBE_URL]`
 
 ## Team contributions

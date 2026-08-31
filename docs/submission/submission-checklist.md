@@ -5,8 +5,8 @@ verified from the repository and must be completed before submission.
 
 ## Repository and access
 
-- [ ] **TEAM INPUT:** Confirm the repository is public and accessible while signed out.
-- [ ] **TEAM INPUT:** Add the final repository URL: `[REPOSITORY_URL]`.
+- [x] **TEAM INPUT:** Confirm the repository is public and accessible while signed out.
+- [x] **TEAM INPUT:** Add the final repository URL: `https://github.com/landonzhao/techjam-conversational-search`.
 - [ ] Confirm the default branch points to the intended submission commit.
 - [x] No commit, push, publication, upload, or Devpost submission was performed during cleanup.
 - [x] Generated `data/catalog.jsonl`, caches, traces, results, `.env`, and Python caches are ignored.
@@ -33,8 +33,8 @@ verified from the repository and must be completed before submission.
 - [x] `requirements-dev.txt` pins the locally verified test/lint/UI tool versions.
 - [x] `requirements-optional.txt` declares optional ML and Gemini dependencies.
 - [x] Catalog preparation, row-count verification, and checksum commands are documented.
-- [ ] **TEAM INPUT:** Publish the catalog release asset and its `SHA256SUMS` file.
-- [ ] **TEAM INPUT:** Add the public catalog release URL: `[CATALOG_RELEASE_URL]`.
+- [x] **TEAM INPUT:** Publish the catalog release asset and its `SHA256SUMS` file.
+- [x] **TEAM INPUT:** Add the public catalog release URL: `https://github.com/landonzhao/techjam-conversational-search/releases/tag/v1.0.0` — SHA-256: `1fd625daa32cc33cd6cc7575316af76e27428fbaebbaf9b2103fd21486681b66`.
 - [x] Development dependencies and documented validation commands were successfully verified by the
   team in a fresh environment.
 - [ ] Verify installation and imports for `requirements-optional.txt` in a separate fresh
