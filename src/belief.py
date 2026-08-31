@@ -171,6 +171,10 @@ class QuestionSelector:
             if cmp:
                 return "other", cmp
         unc = dict(belief.attr_uncertainty)
+        # Skip slots the shopper has explicitly waved off (no_preference)
+        no_pref = getattr(need, "no_preference", set())
+        if no_pref:
+            unc = {s: u for s, u in unc.items() if s not in no_pref}
         facet_word: str | None = None
         if self.adaptive_clarify:
             unc = {s: u for s, u in unc.items()
@@ -244,8 +248,10 @@ class QuestionSelector:
     def _price_range(self, head: list[str]) -> tuple[float, float] | None:
         prices = []
         for a in head:
+            p = self.catalog.get(a, {}).get("price")
             try:
-                prices.append(float(self.catalog.get(a, {}).get("price")))
+                if p is not None:
+                    prices.append(float(p))
             except (TypeError, ValueError):
                 pass
         return (min(prices), max(prices)) if prices else None
@@ -294,10 +300,13 @@ class QuestionSelector:
         t2 = str(self.catalog.get(a2, {}).get("title") or "")
         if not t1 or not t2 or t1[:40] == t2[:40]:
             return None
-        p1 = self.catalog.get(a1, {}).get("price")
-        p2 = self.catalog.get(a2, {}).get("price")
-        desc1 = f"{t1[:50]}" + (f" (${p1:.0f})" if p1 else "")
-        desc2 = f"{t2[:50]}" + (f" (${p2:.0f})" if p2 else "")
+        def _fmt_price(p) -> str:
+            try:
+                return f" (${float(p):.0f})" if p is not None else ""
+            except (TypeError, ValueError):
+                return ""
+        desc1 = f"{t1[:50]}" + _fmt_price(self.catalog.get(a1, {}).get("price"))
+        desc2 = f"{t2[:50]}" + _fmt_price(self.catalog.get(a2, {}).get("price"))
         return f"Are you looking for something more like '{desc1}' or '{desc2}'?"
 
 

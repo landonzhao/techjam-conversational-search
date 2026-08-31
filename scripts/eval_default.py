@@ -9,8 +9,13 @@ Usage:  python -u scripts/eval_default.py
 from __future__ import annotations
 
 import time
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evaluator.local_evaluator import catalog_index, evaluate, load_jsonl
+from scripts.eval_support import new_isolated_agent
 from src.agent import Agent
 
 CATALOG = "data/catalog.jsonl"
@@ -31,10 +36,18 @@ def main() -> None:
     Agent.USE_LLM_INFERENCE = False
     Agent.USE_LLM_RESPONSE = False
     Agent.USE_LLM_RERANK = False
-    agent = Agent(CATALOG)
+    agent = new_isolated_agent(CATALOG)
     print("CURRENT DEFAULT CONFIG — official evaluator", flush=True)
-    print(f"  retrieval_floor={agent.COVERAGE_RETRIEVAL_WEIGHT}  gate={agent.COVERAGE_INFORMATIVE_MIN}  "
-          f"satisfaction={agent.USE_SATISFACTION_RANKER}", flush=True)
+    print(
+        f"  dual_track={agent.USE_DUAL_TRACK_RANKER}  "
+        f"retrieval_weight={agent.DUAL_W_RETRIEVAL}  "
+        f"retrieval_guard_k={agent.DUAL_RETRIEVAL_GUARD_K}  "
+        f"coverage_high={agent.DUAL_W_COVERAGE_HIGH}  "
+        f"leaky_coverage={agent.DUAL_W_LEAKY_COVERAGE}  "
+        f"cumulative_coverage={agent.DUAL_W_CUMULATIVE_COVERAGE}  "
+        f"raw_ngram_bonus={agent.DUAL_RAW_NGRAM_BONUS}",
+        flush=True,
+    )
 
     t0 = time.time()
     show("PUBLIC (leaderboard)", evaluate(agent, load_jsonl("data/public_set.jsonl"),

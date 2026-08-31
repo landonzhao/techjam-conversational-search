@@ -168,12 +168,13 @@ class ProfileService:
     HALFLIFE_DAYS = 45.0   # decay applied at read time
     PRUNE_EPS = 0.05
 
-    def __init__(self, path: str | None = None) -> None:
+    def __init__(self, path: str | None = None, persistent: bool = True) -> None:
         from src.config import PROFILE_STORE
         path = path or PROFILE_STORE
         self.path = Path(path)
+        self.persistent = persistent
         self._store: dict[str, dict] = {}
-        if self.path.exists():
+        if self.persistent and self.path.exists():
             try:
                 self._store = json.loads(self.path.read_text(encoding="utf-8"))
             except Exception:
@@ -237,6 +238,8 @@ class ProfileService:
         self._store[up.user_id] = up.as_dict()
 
     def _flush(self) -> None:
+        if not self.persistent:
+            return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(json.dumps(self._store), encoding="utf-8")
@@ -275,8 +278,6 @@ class OrchestrationPolicy:
     DENSE_BUYING = 0.20
     DENSE_BROWSING = 0.35
     EXPANSION_WEIGHT = 0.10
-
-    # Phase-specific pool sizes (wider early, tighter late)
     POOL_PROBE = 200
     POOL_CONFIRM = 150
     POOL_DELIVER = 100
@@ -284,22 +285,17 @@ class OrchestrationPolicy:
     def plan(self, ctx: SessionContext, buying_score: float, conv_state: str,
              ask_slot: str | None, warm: bool) -> ExecutionPlan:
         dense = self.DENSE_BROWSING + buying_score * (self.DENSE_BUYING - self.DENSE_BROWSING)
-
-        # Phase-adaptive pool: wider during exploration, tighter once converging
         if conv_state == "DELIVER":
             pool = self.POOL_DELIVER
             rerank_stack = ["satisfaction", "cross_encoder"]
         elif conv_state == "CONFIRM":
             pool = self.POOL_CONFIRM
             rerank_stack = ["satisfaction", "cross_encoder"]
-        else:  # PROBE / explore
+        else:
             pool = self.POOL_PROBE
             rerank_stack = ["personalization", "satisfaction"]
-
-        # Warm sessions (known user profile) use a tighter pool — profile already narrows candidates
         if warm and conv_state == "PROBE":
             pool = min(pool, 150)
-
         weights = {"dense": dense, "expansion": self.EXPANSION_WEIGHT}
         return ExecutionPlan(
             routes=["bm25", "dense", "expansion"],
@@ -321,13 +317,14 @@ class GuidanceLearner:
     LAMBDA = 0.5  # guidance multiplier strength
     EMA = 0.3     # online update rate
 
-    def __init__(self, path: str | None = None) -> None:
+    def __init__(self, path: str | None = None, persistent: bool = True) -> None:
         from src.config import GUIDANCE_STORE
         path = path or GUIDANCE_STORE
         self.path = Path(path)
+        self.persistent = persistent
         self.stats: dict[str, float] = {}
         self.waveoff: dict[str, float] = {}
-        if self.path.exists():
+        if self.persistent and self.path.exists():
             try:
                 d = json.loads(self.path.read_text(encoding="utf-8"))
                 self.stats = dict(d.get("stats", {}))
@@ -368,6 +365,8 @@ class GuidanceLearner:
         return out
 
     def _flush(self) -> None:
+        if not self.persistent:
+            return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(

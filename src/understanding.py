@@ -143,6 +143,7 @@ class NeedModel:
     """The session's revisable structured understanding of what the shopper wants."""
     constraints: list[Constraint] = field(default_factory=list)
     category: str | None = None
+    no_preference: set = field(default_factory=set)  # slots the shopper has explicitly waved off
 
     def revise(self, new: list[Constraint], is_override: bool = False) -> None:
         """Non-monotonic merge (DST selective-overwrite) with surgical correction rules.

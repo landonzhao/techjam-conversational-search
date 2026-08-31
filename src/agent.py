@@ -238,6 +238,10 @@ class Agent:
     DCP_PROFILE = True
     DCP_ORCHESTRATION = True
     DCP_GUIDANCE_LEARNING = True
+    # Benchmark pool-size override: when set to an int, _pool_size() returns this value regardless
+    # of personalization/DCP settings. Lets ablation scripts disable profile signals without
+    # shrinking recall. None = normal behaviour.
+    POOL_SIZE_OVERRIDE: "int | None" = None
 
     def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
         try:
@@ -882,6 +886,8 @@ class Agent:
         return picks
 
     def _pool_size(self, state: ConversationState, turn: int = 0) -> int:
+        if self.POOL_SIZE_OVERRIDE is not None:
+            return int(self.POOL_SIZE_OVERRIDE)
         if not self.USE_PERSONALIZATION:
             return POOL_NO_PERSONALIZATION
         base = POOL_SIZE

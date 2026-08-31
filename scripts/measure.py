@@ -31,7 +31,9 @@ def main() -> None:
     if args.limit:
         samples = samples[: args.limit]
     catalog_ids, categories, products = catalog_index(args.catalog)
-    result = evaluate(Agent(args.catalog), samples, catalog_ids, categories, products)
+    from scripts.eval_support import new_isolated_agent
+    result = evaluate(new_isolated_agent(args.catalog, agent_cls=Agent),
+                      samples, catalog_ids, categories, products)
     print(json.dumps({k: v for k, v in result.items() if k != "sessions"}, indent=2))
 
 

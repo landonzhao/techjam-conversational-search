@@ -98,6 +98,7 @@ class ConversationState:
     phase: str = "explore"
     last_pool: int = 0
     constraint_phrases: list = field(default_factory=list)
+    constraint_phrase_turns: list[int] = field(default_factory=list)  # parallel turn metadata
     override_turn: int | None = None  # turn number of last intent override (for pool boost)
 
     need: NeedModel = field(default_factory=NeedModel)
@@ -136,12 +137,18 @@ def phase_transition(
 def next_ask(state: ConversationState, use_info_gain: bool, info_gain_mode: str) -> str | None:
     """Return the attribute to request next.
 
-    In 'display' mode (benchmark-safe): always ask 'other' to maximize constraint
-    extraction; info-gain phrasing is voiced in the message but doesn't change ask_attribute.
-    In 'ask' mode: the info-gain selector drives the actual ask_attribute field.
+    When USE_INFO_GAIN_QUESTION is on: the info-gain selector's ig_attr is surfaced directly
+    (both 'ask' and 'display' modes). DELIVER state returns None so the response builder uses
+    DELIVER phrasing rather than another slot question.
+    Fallback (info_gain off or ig_attr unset): cycle through ASK_PRIORITY.
     """
-    if use_info_gain and info_gain_mode == "ask":
-        return state.ig_attr
+    if use_info_gain and state.ig_attr is not None:
+        if state.conv_state == "DELIVER":
+            return None
+        # Don't ask about a slot the shopper has already waved off
+        no_pref = getattr(state.need, "no_preference", set())
+        if state.ig_attr not in state.boundary_attrs and state.ig_attr not in no_pref:
+            return state.ig_attr
 
     for attr in ASK_PRIORITY:
         if attr in state.boundary_attrs:
@@ -175,10 +182,10 @@ def compose_message(
     Priority: belief-driven info-gain phrasing (if enabled) > intent-aware
     phrasing > default attribute prompts.
     """
-    if use_info_gain and state.ig_phrasing:
-        return state.ig_phrasing
     if not ask_attr:
         return "Here are the closest matches I found."
+    if use_info_gain and state.ig_phrasing:
+        return state.ig_phrasing
     if state.intent == "browsing" and state.phase == "explore":
         return "To narrow things down, what matters most to you about this item?"
     return _DEFAULT_PROMPTS.get(ask_attr, "Could you tell me more about what you want?")
