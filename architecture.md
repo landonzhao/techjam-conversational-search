@@ -1,4 +1,4 @@
-# TechJam Conversational Search Architecture
+# TokenMaxx Copilot Architecture
 
 This document describes the implementation at commit `d2ef469` as verified on 31 August 2026.
 Configuration flags describe what the code attempts to enable; optional components only execute
@@ -324,7 +324,8 @@ Production deployment is therefore unverified and intentionally not claimed.
 - Durable profile storage is local JSON with best-effort writes, not a transactional data store.
 - The trace UI has no authentication, accessibility audit, or browser-test suite.
 - A prompt file for query rewriting exists but has no active consumer.
-- No license has been selected for the repository itself.
+- The repository's MIT License covers the team's original source code, not the Amazon Reviews
+  2023-derived data, downloaded model weights, APIs, or other third-party materials.
 
 ## Practical future improvements
 
@@ -340,7 +341,7 @@ Without changing the current submission behavior, the next engineering steps sho
 6. add a container or deployment manifest only after a production target is chosen;
 7. run a human-language evaluation independent of target-derived simulator phrasing;
 8. complete a privacy review and retention policy before storing real-user profiles or traces;
-9. select and add an explicit repository license with dataset/model license compatibility review.
+9. complete the dataset, model, API, and submission-asset license compatibility review.
 
 ## Verified baseline
 

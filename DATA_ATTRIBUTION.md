@@ -7,7 +7,13 @@ This competition package is derived from **Amazon Reviews 2023**, published by M
 - Product join key: `parent_asin`
 - Competition modality: text and structured product metadata only
 
-The competition package does not contain images, videos, account credentials, private organizer labels, or the private holdout sessions.
+The competition package does not contain images, videos, account credentials, private organizer
+labels, or the private holdout sessions.
 
-Participants must follow the source dataset's applicable terms and use the data only for the competition, research, and other permitted purposes. The competition organizer does not claim ownership of the underlying Amazon review or product content.
+Participants must follow the source dataset's applicable terms and use the data only for the
+competition, research, and other permitted purposes. The competition organizer does not claim
+ownership of the underlying Amazon review or product content.
 
+The repository's MIT License applies only to the team's original source code. It does not relicense
+the Amazon Reviews 2023-derived catalog or evaluation data, which remain subject to their source and
+competition terms.

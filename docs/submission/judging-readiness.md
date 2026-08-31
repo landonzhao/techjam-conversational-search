@@ -153,7 +153,7 @@ the final validation reproduced them.
 - Root README and `architecture.md` provide reviewer-oriented setup, diagrams, component maps,
   limitations, and reproduced results.
 - `docs/submission/devpost-description.md` supplies a complete public-description draft with
-  placeholders for unverifiable links and credits.
+  confirmed team credits and placeholders for unverifiable publication links.
 - `docs/submission/demo-video-script.md` provides a timed narrative, verified demo path, recording
   checks, rights reminders, and YouTube visibility checks.
 - `docs/submission/submission-checklist.md` separates complete work from team/publishing actions.
@@ -162,8 +162,8 @@ the final validation reproduced them.
 
 ### Remaining weaknesses
 
-- Repository URL, public video URL, team contributions, catalog release URL, and final license are
-  unresolved.
+- Repository URL, public video URL, catalog release URL, and team consent to public credits remain
+  unresolved. The project title, contribution breakdown, and MIT source-code license are recorded.
 - Older experiment/roadmap documents contain historical metrics and can confuse readers who skip
   their new historical-baseline warnings.
 - The developer UI needs an accessibility/browser review and should not be presented as a polished

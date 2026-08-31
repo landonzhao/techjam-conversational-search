@@ -2,12 +2,10 @@
 
 ## Project title and tagline
 
-**ShopCopilot**
+**TokenMaxx Copilot**
 
-*An offline-first conversational shopping agent that turns incomplete, changing preferences into
-ranked product recommendations.*
-
-`[TEAM INPUT: confirm the public project name and tagline before publishing.]`
+*Offline-first conversational search that turns changing preferences into ranked product
+recommendations.*
 
 ## Inspiration and problem
 
@@ -24,7 +22,7 @@ inspect and correct.
 
 ## What it does
 
-ShopCopilot searches a frozen 50,000-product clothing, shoes, and jewelry catalog over a conversation
+TokenMaxx Copilot searches a frozen 50,000-product clothing, shoes, and jewelry catalog over a conversation
 of up to ten turns. On each turn it can ask one structured follow-up question, return ranked product
 IDs, or do both.
 
@@ -41,7 +39,7 @@ The agent:
 
 ## How it addresses the challenge
 
-The challenge rewards finding one hidden target product early and high in the top ten. ShopCopilot
+The challenge rewards finding one hidden target product early and high in the top ten. TokenMaxx Copilot
 maps each judging-relevant problem to a concrete component:
 
 - **Recall:** field-weighted SQLite FTS5 BM25, optional BGE dense search, and reciprocal-rank fusion.
@@ -57,7 +55,7 @@ maps each judging-relevant problem to a concrete component:
 ## End-to-end user experience
 
 1. The shopper begins with a product category, a hard constraint, or an exploratory statement.
-2. ShopCopilot retrieves and ranks an initial candidate pool.
+2. TokenMaxx Copilot retrieves and ranks an initial candidate pool.
 3. When confidence is low, it asks for one attribute or presents useful alternatives to compare.
 4. The shopper adds, removes, or revises a preference.
 5. The state ledger updates the active need, retrieval and ranking rerun, and the agent reveals the
@@ -202,7 +200,8 @@ monitoring, load tests, and a defined deployment target. None of those are claim
 - The largest modules remain complex and type checking is not yet clean.
 - There is no production deployment, load test, formal latency result, or real-user study.
 - The local trace UI is not authenticated or production-hardened.
-- The repository has not selected a source-code license.
+- The team's original source code is MIT-licensed; datasets, downloaded model weights, APIs, and
+  other third-party materials remain subject to their respective terms.
 
 ## Future improvements
 
@@ -223,9 +222,12 @@ monitoring, load tests, and a defined deployment target. None of those are claim
 
 ## Team contributions
 
-- `[TEAM_MEMBER_1]` — `[CONTRIBUTION]`
-- `[TEAM_MEMBER_2]` — `[CONTRIBUTION]`
-- `[TEAM_MEMBER_3]` — `[CONTRIBUTION]`
-- `[ADD OR REMOVE ROWS AS NEEDED]`
-
-Do not infer roles from commit authors alone; confirm this section with the team.
+- **Landon Zhao** — Led the modular conversational-search architecture, hybrid retrieval and ranking
+  work, dialogue strategy, dynamic conversation policy, session context, intent-override handling,
+  and ranking robustness evaluation.
+- **Valerie Lim** — Developed and evaluated satisfaction-ranking and leak-free retrieval
+  improvements, strengthened regression and experiment tooling, resolved integration issues, and
+  led final repository stabilization, validation, documentation, and submission preparation.
+- **Bryan Koh** — Implemented the correction-aware state ledger, evaluator isolation and retrieval
+  optimizations, dual-track ranking and coverage mechanisms, structured clarification behavior, and
+  contradiction/negation handling.

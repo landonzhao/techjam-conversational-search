@@ -18,13 +18,13 @@ verified from the repository and must be completed before submission.
 ## README and architecture
 
 - [x] README contains purpose, solution, features, stack, setup, environment, commands, example flow,
-  troubleshooting, limitations, future work, team placeholder, and license status.
+  troubleshooting, limitations, future work, team contributions, and license status.
 - [x] Root `architecture.md` documents actual components, data flow, APIs/models, configuration,
   fallbacks, security/privacy, performance, runtime, limitations, and future work.
 - [x] Architecture includes Mermaid context and sequence diagrams.
 - [x] Stale `docs/ARCHITECTURE.md` was moved to the required root location rather than duplicated.
 - [x] Internal links were updated to the root architecture document.
-- [ ] **TEAM INPUT:** Replace all bracketed URLs and contributor placeholders.
+- [ ] **TEAM INPUT:** Replace all bracketed URL placeholders.
 
 ## Installation reproducibility
 
@@ -35,7 +35,10 @@ verified from the repository and must be completed before submission.
 - [x] Catalog preparation, row-count verification, and checksum commands are documented.
 - [ ] **TEAM INPUT:** Publish the catalog release asset and its `SHA256SUMS` file.
 - [ ] **TEAM INPUT:** Add the public catalog release URL: `[CATALOG_RELEASE_URL]`.
-- [ ] Verify setup from a fresh virtual environment or clean machine before the deadline.
+- [x] Development dependencies and documented validation commands were successfully verified by the
+  team in a fresh environment.
+- [ ] Verify installation and imports for `requirements-optional.txt` in a separate fresh
+  environment; live Gemini use requires a valid credential and is not a baseline requirement.
 
 ## End-to-end demo reliability
 
@@ -52,7 +55,9 @@ verified from the repository and must be completed before submission.
 - [x] `demo-video-script.md` completed with scene timing, narration, checklist, rights reminder, and
   YouTube visibility checks.
 - [x] `judging-readiness.md` completed against all five weighted categories.
-- [ ] **TEAM INPUT:** Confirm Devpost title/tagline and edit prose into the platform's current fields.
+- [x] Devpost title/tagline confirmed as **TokenMaxx Copilot** — “Offline-first conversational search that
+  turns changing preferences into ranked product recommendations.”
+- [ ] **TEAM INPUT:** Edit the prepared prose into the platform's current fields.
 - [ ] **TEAM INPUT:** Record and upload the demo video.
 - [ ] **TEAM INPUT:** Add public YouTube URL: `[PUBLIC_YOUTUBE_URL]`.
 - [ ] **TEAM INPUT:** Add the video URL to Devpost and verify the embed while signed out.
@@ -66,15 +71,14 @@ verified from the repository and must be completed before submission.
 - [x] Credential-pattern scan found no API-key/private-key-shaped values in tracked source/docs.
 - [x] `.env` is ignored and `.env.example` contains placeholders only.
 - [ ] Manually inspect final video frames and repository history for personal data or credentials.
-- [ ] **TEAM INPUT:** Select a source-code license or explicitly retain the current “no license
-  selected” notice.
+- [x] The team's original source code is licensed under the MIT License in the root `LICENSE` file.
 - [ ] Verify code, dataset, model, API, and any added video-asset licenses are compatible.
 
 ## Team contributions
 
-- [ ] **TEAM INPUT:** List every team member by the name required by the platform.
-- [ ] **TEAM INPUT:** Attribute concrete product, engineering, data, evaluation, design,
-  documentation, and presentation work.
+- [x] Team members are listed as Landon Zhao, Valerie Lim, and Bryan Koh.
+- [x] Concrete engineering, evaluation, documentation, and submission contributions are attributed
+  in the README and Devpost draft.
 - [ ] Confirm all listed members consent to public names/credits.
 
 ## Baseline validation before cleanup
@@ -108,6 +112,7 @@ Update this table if any final command changes before submission.
 | `/opt/anaconda3/bin/python app/trace_server.py --host 127.0.0.1 --port 5059` + localhost requests | PASS outside the managed network sandbox — server bound successfully; `/` and `/api/datasets` responded; process was stopped after the smoke test. |
 | `python3 -m evaluator.robustness --limit 40` | PASS — all four configurations completed; each reported Hit@10 `0.725`, MRR `0.515`, MTTC `5.55`, score `0.6260` on this bounded no-optional-model run. |
 | Fresh temporary virtual environment + `pip install -r requirements.txt` + FTS5 probe | PASS; the core manifest installs without third-party packages and FTS5 is available. |
+| Fresh development environment + `requirements.txt` and `requirements-dev.txt` installation + documented development checks | PASS — completed successfully and reported by the team. |
 | Current `eval_matrix` configuration/popularity helper smoke | PASS — obsolete dual-track attributes removed; current coverage/satisfaction rows configure without error. |
 | `black --check ...` | Expected unresolved failure; large historical formatting diff, not made a gate. |
 | `mypy --explicit-package-bases --ignore-missing-imports ...` | Expected unresolved failure; 92 pre-existing/dynamic typing errors in 21 files after removal of stale evaluation-script attributes. |
@@ -118,7 +123,8 @@ Update this table if any final command changes before submission.
 - [x] Confirm the four recent ranking files still match commit `d2ef469` except mechanical cleanup.
 - [x] Confirm no tests, lint rules, or type-check settings were weakened.
 - [x] Confirm no generated, vendored, private, or large local artifact was unintentionally added.
-- [ ] Confirm README commands in a fresh environment.
+- [x] Confirm README development commands in a fresh environment; completed successfully by the
+  team.
 - [x] Confirm every local Markdown link resolves.
 - [x] Search for unresolved placeholders: `rg -n '\[[A-Z_]+\]|TEAM INPUT' README.md docs/submission`; remaining items are intentionally listed above for team input.
 - [x] Repeat secret scan for the final cleanup diff; repeat once more immediately before publishing.

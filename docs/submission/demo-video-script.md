@@ -1,4 +1,4 @@
-# Demo Video Script
+# TokenMaxx Copilot Demo Video Script
 
 ## Recommended structure
 
@@ -15,7 +15,7 @@ minutes, shorten the architecture and next-steps scenes rather than speeding up 
 **Narration:**
 
 > Product search assumes shoppers know the catalog's keywords. Real shoppers start vague, describe
-> an occasion, decline to choose an attribute, or change their minds. ShopCopilot turns that evolving
+> an occasion, decline to choose an attribute, or change their minds. TokenMaxx Copilot turns that evolving
 > conversation into an explicit need and ranked product recommendations.
 
 ### 0:18–0:35 — Solution
@@ -47,7 +47,7 @@ constraints, retrieval/ranking summary, and target rank.
 
 **Narration:**
 
-> The next answer reveals a distinctive feature. ShopCopilot updates its state, reruns retrieval and
+> The next answer reveals a distinctive feature. TokenMaxx Copilot updates its state, reruns retrieval and
 > need-satisfaction ranking, and returns target `B09PYB7B6Z` at rank one. This verified flow used zero
 > model tokens.
 

@@ -1,4 +1,7 @@
-# TechJam Conversational Search
+# TokenMaxx Copilot
+
+*Offline-first conversational search that turns changing preferences into ranked product
+recommendations.*
 
 An offline-first conversational shopping agent that asks focused follow-up questions and ranks a
 hidden target product from a 50,000-item clothing, shoes, and jewelry catalog in at most ten turns.
@@ -368,15 +371,21 @@ state. Do not compare regenerated datasets with the frozen tracked sets.
 
 ## Team contributions
 
-`[TEAM INPUT REQUIRED: add each member's name and specific product, engineering, data, evaluation,
-design, documentation, and presentation contributions before submission.]`
-
-Git history contains contributor identities, but this README does not infer team roles from commit
-metadata.
+- **Landon Zhao** — Led the modular conversational-search architecture, hybrid retrieval and ranking
+  work, dialogue strategy, dynamic conversation policy, session context, intent-override handling,
+  and ranking robustness evaluation.
+- **Valerie Lim** — Developed and evaluated satisfaction-ranking and leak-free retrieval
+  improvements, strengthened regression and experiment tooling, resolved integration issues, and
+  led final repository stabilization, validation, documentation, and submission preparation.
+- **Bryan Koh** — Implemented the correction-aware state ledger, evaluator isolation and retrieval
+  optimizations, dual-track ranking and coverage mechanisms, structured clarification behavior, and
+  contradiction/negation handling.
 
 ## License
 
-No repository license has been selected. All rights remain with their respective owners unless a
-license is added. Before public submission, the team must choose a source-code license and verify
-that dataset, model, API, and asset terms are compatible. Amazon Reviews 2023 attribution and data
-use notes are in [`DATA_ATTRIBUTION.md`](DATA_ATTRIBUTION.md).
+The original source code in this repository is licensed under the MIT License. See
+[`LICENSE`](LICENSE).
+
+The Amazon Reviews 2023-derived datasets and catalog, downloaded model weights, APIs, and other
+third-party materials are not covered by the repository's MIT License. They remain subject to their
+respective licenses and terms. See [`DATA_ATTRIBUTION.md`](DATA_ATTRIBUTION.md).
