@@ -353,6 +353,27 @@ USE_NL_CONSTRAINTS: bool = True
 SINGLE_VALUED_SLOTS: tuple[str, ...] = ("category", "size", "budget")
 
 # ---------------------------------------------------------------------------
+# TCRS: pool-shrinkage as evidence-based phase advance (CIKM 2024).
+# When the retrieved candidate count drops below TCRS_SHRINKAGE_RATIO * initial_pool,
+# the active constraints have demonstrably narrowed the catalog — advance PROBE → CONFIRM
+# early without waiting for the belief confidence threshold. Guards: turn > 1 AND
+# belief.item_confidence >= 0.15 (some signal exists, not just a tiny catalog).
+# Expected impact: MTTC −0.2 to −0.5 turns on sessions with hard constraints.
+USE_TCRS_PHASE_SHRINKAGE: bool = True
+TCRS_SHRINKAGE_RATIO: float = 0.50   # advance when pool < 50% of turn-1 pool
+TCRS_MIN_ITEM_CONF: float = 0.15     # guard: minimum belief.item_confidence to fire
+
+# ---------------------------------------------------------------------------
+# APR: compact keyword CE query instead of full conversation history (SIGIR 2025, arxiv 2508.08634).
+# Theory: MS-MARCO CEs expect short queries, not full conversation history.
+# MEASURED: net negative on this evaluator/dataset. Full conversation history provides product-type
+# context that helps the CE disambiguate near-ties (buying MRR 0.800→0.747 with APR on; even the
+# keyword-phrase variant 0.800→0.747). The CE needs the full context to rank correctly when the
+# constraint phrase alone is short ("polyester" vs "polyester slip dress" in full history).
+# Kept as ablation hook; OFF by default to preserve the floor.
+USE_CE_STRUCTURED_QUERY: bool = False
+
+# ---------------------------------------------------------------------------
 # DCP (context engine)
 PROFILE_STORE: str = "cache/profiles.json"
 GUIDANCE_STORE: str = "cache/guidance_global.json"

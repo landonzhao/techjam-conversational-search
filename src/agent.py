@@ -35,6 +35,8 @@ from src.config import (
     USE_SNIPPET_RATIONALE, USE_CONTRAST_RATIONALE,
     USE_CATEGORY_GATE, USE_LTR,
     USE_SATISFACTION_RANKER,
+    USE_TCRS_PHASE_SHRINKAGE, TCRS_SHRINKAGE_RATIO, TCRS_MIN_ITEM_CONF,
+    USE_CE_STRUCTURED_QUERY,
 )
 from src.context_engine import (
     ContextDistiller, GuidanceLearner, OrchestrationPolicy, ProfileService,
@@ -229,6 +231,17 @@ class Agent:
     # nothing verbatim on turn 1 and so were revealed — and locked — at a bad rank.
     REVEAL_REQUIRE_CONSTRAINTS = False  # require a fresh constraint to hold back
     REVEAL_TURN_CAP = 4                 # reveal unconditionally at/after this turn
+
+    # TCRS: advance PROBE→CONFIRM when the candidate pool shrinks to < 50% of the turn-1 pool.
+    # Pool shrinkage is stronger evidence than turn count alone that constraints are working.
+    # Paper: TCRS CIKM 2024. Expected impact: MTTC −0.2 to −0.5 turns.
+    USE_TCRS_PHASE_SHRINKAGE = USE_TCRS_PHASE_SHRINKAGE
+    TCRS_SHRINKAGE_RATIO = TCRS_SHRINKAGE_RATIO
+    TCRS_MIN_ITEM_CONF = TCRS_MIN_ITEM_CONF
+    # APR: compact keyword CE query instead of raw conversation history (SIGIR 2025, 2508.08634).
+    # MEASURED NEGATIVE on this dataset: full history provides product-type disambiguation context
+    # the CE needs. Off by default; kept as ablation hook. See config.USE_CE_STRUCTURED_QUERY.
+    USE_CE_STRUCTURED_QUERY = USE_CE_STRUCTURED_QUERY  # default False
 
     # Context engine (OPTIONAL, on but UNPROVEN on the scored path). The DCP layer — session
     # distillation, long-term profiles, adaptive orchestration, guidance learning — is a
@@ -491,6 +504,9 @@ class Agent:
         candidates = self._retrieve(state, pool)
         retrieval_order = list(candidates)   # original fused order, for the LTR retrieval_rank feature
         state.last_pool = len(candidates)
+        # TCRS: record the first retrieval's candidate count as the baseline for pool shrinkage.
+        if state.initial_pool == 0 and state.last_pool > 0:
+            state.initial_pool = state.last_pool
         self._tracer.stage("retrieval", pool_size=pool, candidates_returned=len(candidates))
 
         if self.USE_PROACTIVE_STATE:
@@ -604,6 +620,24 @@ class Agent:
                 state.belief, list(state.belief.attr_uncertainty), turn,
                 last_turn=SESSION_MAX_TURNS)
 
+            # TCRS: pool shrinkage as an evidence-based phase advance signal.
+            # When retrieved candidates have dropped to < TCRS_SHRINKAGE_RATIO of the initial pool,
+            # the active constraints are demonstrably narrowing the catalog; advance PROBE → CONFIRM
+            # rather than waiting for the belief confidence threshold alone. The item_confidence
+            # guard prevents firing on near-empty categories where a small pool isn't evidence.
+            if (self.USE_TCRS_PHASE_SHRINKAGE
+                    and state.conv_state == "PROBE"
+                    and turn > 1
+                    and state.initial_pool > 0
+                    and state.last_pool < self.TCRS_SHRINKAGE_RATIO * state.initial_pool
+                    and state.belief.item_confidence >= self.TCRS_MIN_ITEM_CONF):
+                state.conv_state = "CONFIRM"
+                if self._tracer.enabled:
+                    self._tracer.note(
+                        f"TCRS advance: PROBE→CONFIRM "
+                        f"(pool {state.last_pool}/{state.initial_pool} "
+                        f"= {state.last_pool/state.initial_pool:.2f} < {self.TCRS_SHRINKAGE_RATIO})")
+
             if self.USE_DCP and self.DCP_GUIDANCE_LEARNING:
                 waved = state.prev_ask in state.boundary_attrs if state.prev_ask else False
                 self._guidance.observe(
@@ -629,8 +663,10 @@ class Agent:
         ce_score_map: dict[str, float] = {}
         if self._cross_encoder is not None and candidates and near_tie:
             base = list(candidates)
+            ce_query = (self._build_ce_query(state) if self.USE_CE_STRUCTURED_QUERY
+                        else state.query_text())
             ce_scores = self._cross_encoder.scores(
-                state.query_text(), base, self.CE_DEPTH)
+                ce_query, base, self.CE_DEPTH)
             if ce_scores:
                 ce_score_map = {base[i]: ce_scores[i] for i in range(len(ce_scores))}
                 # Regime routing: gate CE-convex on actual catalog evidence, not a noisy proxy.
@@ -983,6 +1019,39 @@ class Agent:
             seen.add(value)
             out.append(value)
         return out
+
+    def _build_ce_query(self, state: "ConversationState") -> str:
+        """Build a compact natural-language query for the cross-encoder.
+
+        MS-MARCO CEs were trained on short natural-language queries (~5–15 words), not raw
+        multi-turn conversation history (100+ words). A concise keyword phrase matching the
+        training distribution sharpens re-ranking on constraint-heavy turns.
+
+        Strategy (in priority order):
+        1. Verbatim constraint phrases — already natural language, maximally specific.
+        2. NeedModel slot VALUES concatenated as keywords (no "slot: value" labels; values are
+           natural words; labels look like structured metadata the CE wasn't trained on).
+        3. Last user message (short, specific, avoids accumulated history noise).
+
+        Reference: APR (Aspect-based Product Retrieval), SIGIR 2025, arxiv 2508.08634.
+        """
+        # Primary: verbatim constraint phrases — natural language, evaluator-aligned.
+        if state.constraint_phrases:
+            return " ".join(state.constraint_phrases[:4])[:300]
+
+        # Secondary: NeedModel positive VALUES as a keyword phrase (no "slot:" labels).
+        # "boot leather black" is a natural MS-MARCO-style query; "category: boot" is not.
+        values: list[str] = []
+        if state.need.category:
+            values.append(state.need.category)
+        for c in state.need.positives():
+            if c.slot not in ("category", "budget") and c.value:
+                values.append(c.value)
+        if values:
+            return " ".join(values[:8])
+
+        # Fallback: last user message (most recent, shortest, avoids history noise).
+        return (state.all_text[-1] if state.all_text else "")[:250]
 
     def _trace_top_picks(
         self, candidates: list[str], cov_scores: dict[str, float], n: int = 5

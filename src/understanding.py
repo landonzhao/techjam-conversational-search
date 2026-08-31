@@ -45,6 +45,9 @@ NEG_FEATURE_RE = re.compile(
 USE_CASE_KEYS = (
     "hiking", "running", "gym", "workout", "winter", "summer", "beach", "formal",
     "office", "wedding", "work", "casual", "travel", "party", "outdoor", "rain", "sport",
+    # COSMO-lite extensions: common fashion/apparel occasions underrepresented in the seed lexicon
+    "yoga", "pilates", "cycling", "skiing", "golf", "tennis", "dance", "festival",
+    "nursing", "interview", "camping", "brunch", "marathon",
 )
 
 # Coarse apparel categories. Grounds the shopper's own head noun ("coat", "sneakers") so
@@ -409,7 +412,11 @@ class ExpansionTable:
 
 
 # Occasion → implied attribute terms ("winter jacket" implies warmth/insulation).
+# COSMO-lite: extended from 19 → 32 entries covering common fashion/apparel use-cases
+# that shoppers express but the seed lexicon didn't cover. Terms feed the BM25 expansion
+# side-track (EXPANSION_WEIGHT=0.1) and LLMUseCaseInferrer's static fallback path.
 USE_CASE_LEXICON: dict[str, dict[str, set[str]]] = {
+    # --- original entries ---
     "hiking":  {"terms": {"waterproof", "rugged", "grip", "traction", "gore-tex", "durable"}},
     "trail":   {"terms": {"waterproof", "rugged", "grip", "traction"}},
     "running": {"terms": {"lightweight", "breathable", "cushioned", "athletic"}},
@@ -429,6 +436,20 @@ USE_CASE_LEXICON: dict[str, dict[str, set[str]]] = {
     "party":   {"terms": {"elegant", "sparkle", "dressy"}},
     "travel":  {"terms": {"packable", "lightweight", "wrinkle-resistant"}},
     "casual":  {"terms": {"relaxed", "everyday", "comfortable"}},
+    # --- COSMO-lite extensions ---
+    "yoga":      {"terms": {"spandex", "stretch", "breathable", "fitted", "moisture-wicking", "flexible"}},
+    "pilates":   {"terms": {"stretch", "breathable", "fitted", "flexible", "comfort"}},
+    "cycling":   {"terms": {"padded", "moisture-wicking", "tight", "breathable", "aerodynamic"}},
+    "skiing":    {"terms": {"insulated", "waterproof", "windproof", "thermal", "layering"}},
+    "golf":      {"terms": {"polo", "breathable", "moisture-wicking", "uv", "stretch"}},
+    "tennis":    {"terms": {"athletic", "breathable", "grip", "lightweight", "stretch"}},
+    "dance":     {"terms": {"flexible", "stretch", "lightweight", "breathable", "comfort"}},
+    "festival":  {"terms": {"comfortable", "casual", "lightweight", "durable", "waterproof"}},
+    "nursing":   {"terms": {"scrubs", "comfortable", "slip-resistant", "durable", "stretch"}},
+    "interview": {"terms": {"professional", "formal", "tailored", "business", "smart"}},
+    "camping":   {"terms": {"waterproof", "warm", "durable", "insulated", "rugged"}},
+    "brunch":    {"terms": {"casual", "chic", "comfortable", "lightweight", "everyday"}},
+    "marathon":  {"terms": {"lightweight", "breathable", "cushioned", "anti-chafe", "moisture-wicking"}},
 }
 
 

@@ -97,6 +97,7 @@ class ConversationState:
     buying_score: float = 0.5
     phase: str = "explore"
     last_pool: int = 0
+    initial_pool: int = 0  # turn-1 candidate count; used by TCRS pool-shrinkage detector
     constraint_phrases: list = field(default_factory=list)
     constraint_phrase_turns: list[int] = field(default_factory=list)  # parallel turn metadata
     override_turn: int | None = None  # turn number of last intent override (for pool boost)
