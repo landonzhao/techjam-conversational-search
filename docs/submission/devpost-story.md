@@ -94,11 +94,13 @@ message + profile
 
 ## What we learned
 
-Building the honest set was the most valuable thing we did. It forced every feature decision to answer one question: does this help because the pipeline is better, or because the simulator leaks?
+**Measure what you're actually optimising.** Early on we noticed the public evaluator generates customer messages using phrases lifted directly from the target product's catalog description. A retriever that memorises popular phrasing can score 0.96 Hit@10 without understanding a single natural sentence. That realisation changed how we made every subsequent decision — we stopped asking "does this raise the score?" and started asking "does this help because the pipeline is better?"
 
-The ~9-point gap between our public score (0.9001) and honest-set score (0.8071) is not a failure — it is an accurate measurement of how much work the verbatim signal is doing. The cross-encoder and structured-constraint tracks are the designed answer to closing it on the private set and in production.
+**Good engineering and good benchmarking are not the same thing.** The MMR diversifier, the GuidanceLearner, the correction-aware ledger — none of these move the public leaderboard number meaningfully, and some hurt it. But they are the features that would matter in a real deployment. Separating "scored path" from "production path" explicitly, and documenting the reason for each flag, was one of the more useful structural decisions we made.
 
-The second lesson: the features that matter most for real users — result diversity, self-improving question selection, correction-aware memory — are all penalised or invisible in the benchmark. Knowing which flags to turn on for scoring versus which to turn on for a real storefront requires building both and measuring both.
+**Ablation discipline is worth the time.** We ran a measured ablation before shipping every feature to the scored path. Several things we were confident would help turned out to be neutral or negative (semantic coverage hurt robustness; APR hurt disambiguation). Without the numbers we would have shipped them and not known why the score moved. The flag ledger in `src/agent.py` is the artefact of that discipline — every flag has a measured justification or an explicit "unproven" label.
+
+**The private set is the real test.** Everything we built for the honest set — the cross-encoder, regime routing, structured constraints — was built knowing the private evaluation sessions would not have the same verbatim overlap. Public score is a guardrail. The honest set is the actual signal.
 
 ---
 
