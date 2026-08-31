@@ -8,6 +8,9 @@
 
 ## Current State (baseline: `main` after integration-fusion)
 
+> Historical planning snapshot. It is not the current verified default; see `../README.md` and
+> `../architecture.md` for the submission baseline.
+
 | Set | Tech | Hit@10 | MRR | MTTC |
 |---|---|---|---|---|
 | PUBLIC | 0.8841 ✅ | 0.955 | 0.8333 | 3.17 |
@@ -24,7 +27,8 @@ The following planning files have been superseded and removed:
 `RANKING_REDESIGN.md`, `ROBUSTNESS_PLAN.md`, `STRENGTHENING_PLAN.md`, `SYNTHETIC_FINDINGS.md`,
 `TEST_DESIGN.md`, `ADVANCED_RANKING_PLAN.md`.
 
-Source of truth going forward: this file + `EXPERIMENTS.md` + `DECISIONS.md` + `ARCHITECTURE.md`.
+Source of truth going forward: this file + `EXPERIMENTS.md` + `DECISIONS.md` +
+[`architecture.md`](../architecture.md).
 
 ---
 

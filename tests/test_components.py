@@ -5,7 +5,6 @@ Run with: python -m pytest tests/
 """
 from __future__ import annotations
 
-import math
 import unittest
 from collections import Counter
 
@@ -613,8 +612,8 @@ class ProfileRankingFallbackTest(unittest.TestCase):
     """_rank_by_profile: raises tag-matching candidates on empty-constraint turns."""
 
     def _setup(self, catalog=None):
-        from tests.test_components import AgentSmokeTest  # reuse catalog fixture
-        import tempfile, json, pathlib
+        import json
+        import tempfile
         if catalog is None:
             catalog = {
                 "LEATHER": {"title": "genuine leather belt", "features": "durable quality"},

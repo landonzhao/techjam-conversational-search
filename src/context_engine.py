@@ -20,12 +20,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from src.understanding import Belief, Constraint, NeedModel
+from src.understanding import Belief, NeedModel
 
 
 @dataclass

@@ -242,7 +242,8 @@ def main() -> None:
             fh.write(json.dumps(s, ensure_ascii=False) + "\n")
 
     scen = Counter(s["scenario_type"] for s in sessions)
-    mean = lambda xs: sum(xs) / len(xs) if xs else 0.0
+    def mean(values: list[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
     print(f"wrote {len(sessions)} sessions -> {out}")
     print(f"distinct categories covered: {len({s['category_bucket'] for s in sessions})}")
     print(f"scenario mix: {dict(scen)}")

@@ -81,11 +81,9 @@ def main() -> None:
                 msg = initial_message(es, coarse_category(cats.get(target, [])), disclosed)
                 cap.clear()
                 budget = None
-                category = None
                 for turn in range(1, MAX_TURNS + 1):
                     r = agent.respond(sid, msg, turn, TOP_K)
                     st = agent._sessions[sid]
-                    category = st.need.category
                     recs = normalize_recommendations(r.get("recommendations"), cat_ids)
                     if target in recs or turn == MAX_TURNS:
                         break

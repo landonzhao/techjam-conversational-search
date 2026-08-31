@@ -46,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evaluator.local_evaluator import (
     MAX_TURNS, TOP_K, catalog_index, coarse_category, customer_reply, initial_message,
-    load_jsonl, materialize_hidden_fields, normalize_recommendations,
+    load_jsonl, materialize_hidden_fields,
 )
 from src.agent import Agent
 from src.config import RRF_K
@@ -161,7 +161,6 @@ def run(dataset: str, limit: int | None, betas: list[float]) -> None:
         stall = 0
         for turn in range(1, MAX_TURNS + 1):
             turn_cap["sat"] = {}
-            prev_msg = user_message
             try:
                 response = agent.respond(sid, user_message, turn, TOP_K)
             except Exception:
@@ -240,9 +239,12 @@ def run(dataset: str, limit: int | None, betas: list[float]) -> None:
         ttc = statistics.fmean(first_ttc[s]) if first_ttc[s] else float("nan")
         imp = eq = wor = 0
         for a, b in zip(best_rank[s], rrf_best):
-            if a < b: imp += 1
-            elif a > b: wor += 1
-            else: eq += 1
+            if a < b:
+                imp += 1
+            elif a > b:
+                wor += 1
+            else:
+                eq += 1
         print(f"{s:<12} {mrr:>7.4f} {h10:>7.3f} {h3:>7.3f} {h1:>7.3f} "
               f"{med:>8.1f} {mean:>9.1f} {ttc:>7.2f}  {imp:>3}/{eq:>3}/{wor:>3}")
     print("MRR/Hit@10/MTTC* = first top-10 appearance across turns (full pool, no reveal hold-back).")

@@ -39,13 +39,13 @@ def main() -> None:
     agent = new_isolated_agent(CATALOG)
     print("CURRENT DEFAULT CONFIG — official evaluator", flush=True)
     print(
-        f"  dual_track={agent.USE_DUAL_TRACK_RANKER}  "
-        f"retrieval_weight={agent.DUAL_W_RETRIEVAL}  "
-        f"retrieval_guard_k={agent.DUAL_RETRIEVAL_GUARD_K}  "
-        f"coverage_high={agent.DUAL_W_COVERAGE_HIGH}  "
-        f"leaky_coverage={agent.DUAL_W_LEAKY_COVERAGE}  "
-        f"cumulative_coverage={agent.DUAL_W_CUMULATIVE_COVERAGE}  "
-        f"raw_ngram_bonus={agent.DUAL_RAW_NGRAM_BONUS}",
+        f"  satisfaction={agent.USE_SATISFACTION_RANKER}  "
+        f"retrieval_guard={agent.USE_RETRIEVAL_GUARD}  "
+        f"ce_convex={agent.USE_CE_CONVEX}  "
+        f"regime_routing={agent.USE_REGIME_ROUTING}  "
+        f"override_phrase_demote={agent.OVERRIDE_PHRASE_DEMOTE}  "
+        f"vector_available={agent._vector is not None}  "
+        f"cross_encoder_available={agent._cross_encoder is not None}",
         flush=True,
     )
 

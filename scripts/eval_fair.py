@@ -24,7 +24,6 @@ import argparse
 import hashlib
 import sys
 import time
-from pathlib import Path
 
 from evaluator.local_evaluator import catalog_index, evaluate, load_jsonl
 from src.agent import Agent

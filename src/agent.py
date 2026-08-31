@@ -1,7 +1,7 @@
 """Agent orchestrator — official challenge entry point (via starter/agent.py).
 
 Wires together catalog, retrieval, ranking, NLU, dialogue, and context components.
-No retrieval, ranking, or NLU logic lives here; see docs/ARCHITECTURE.md for component locations.
+No retrieval, ranking, or NLU logic lives here; see architecture.md for component locations.
 
 Feature flags on the Agent class are ablation toggles; the robustness harness overrides
 them with setattr(Agent, k, v).
@@ -51,12 +51,12 @@ from src.ranking import (CoverageReranker, Diversifier, NeedSatisfactionScorer, 
 from src.retrieval import VectorRetriever, convex_fuse, rrf, vector_weight
 from src.trace import Tracer, get_tracer
 from src.understanding import (
-    CatalogVocab, ExpansionTable, NeedModel, CATEGORY_CANON, MATERIAL_RE,
+    CatalogVocab, ExpansionTable, CATEGORY_CANON, MATERIAL_RE,
     USE_CASE_KEYS,
-    SlotFiller, UseCaseInferencer, missing_required,
+    SlotFiller, UseCaseInferencer,
 )
 from src.belief import (
-    Belief, BeliefModel, QuestionSelector, RationaleBuilder,
+    BeliefModel, QuestionSelector, RationaleBuilder,
     apply_category_gate, apply_negatives, converge,
 )
 from src.keys import GeminiClientPool
@@ -483,7 +483,6 @@ class Agent:
         state.constraint_phrase_weights.extend([1.0] * len(new_phrases))
 
         if self.USE_NEED_MODEL:
-            is_override_turn = (state.intent == "override")
             regex_constraints = self._slot_filler.parse(user_message, turn)
             state.need.revise(regex_constraints)
             if self.USE_PROFILE_NEGATION_PURGE:
@@ -966,7 +965,7 @@ class Agent:
 
         Returns (ordered_candidates, scores) in the same shape as satisfaction.rank().
         """
-        from src.catalog import TOKEN_RE, terms as _terms
+        from src.catalog import TOKEN_RE
         tag_tokens: set[str] = set()
         for tag in preference_tags:
             tag_tokens.update(TOKEN_RE.findall(tag.lower()))

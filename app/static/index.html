@@ -107,20 +107,20 @@
   <div class="brand"><span class="dot">🛍</span> ShopCopilot <span style="color:var(--faint);font-weight:600;font-size:13px">Conversation Studio</span></div>
   <div class="controls">
     <div class="seg" id="source">
-      <button data-v="live" class="on">Live simulate</button>
-      <button data-v="trace">Saved trace</button>
+      <button type="button" data-v="live" class="on">Live simulate</button>
+      <button type="button" data-v="trace">Saved trace</button>
     </div>
-    <div class="field"><label>Test set</label><select id="dataset"></select></div>
-    <div class="field"><label>Scenario</label><select id="sample" style="min-width:230px;max-width:300px"></select></div>
-    <button class="btn" id="run">Run ▸</button>
-    <button class="btn ghost" id="replay" title="Replay animation">↻</button>
+    <div class="field"><label for="dataset">Test set</label><select id="dataset"></select></div>
+    <div class="field"><label for="sample">Scenario</label><select id="sample" style="min-width:230px;max-width:300px"></select></div>
+    <button type="button" class="btn" id="run">Run ▸</button>
+    <button type="button" class="btn ghost" id="replay" title="Replay animation" aria-label="Replay animation">↻</button>
   </div>
 </div>
 <main>
   <div class="pane" id="chatPane">
     <div class="sessionbar" id="sessionbar"></div>
     <div class="subtle" id="sessionsub"></div>
-    <div id="thread"><div class="placeholder"><div class="big">💬</div><p>Choose a test set and scenario, then press <b>Run</b> to watch the shopper and assistant talk.</p></div></div>
+    <div id="thread" aria-live="polite"><div class="placeholder"><div class="big">💬</div><p>Choose a test set and scenario, then press <b>Run</b> to watch the shopper and assistant talk.</p></div></div>
   </div>
   <div class="pane" id="sidePane">
     <div class="placeholder"><div class="big">🔎</div><p>Tap any assistant message to see<br><b>what the assistant was thinking</b>.</p></div>

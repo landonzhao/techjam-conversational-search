@@ -4,14 +4,15 @@
 > II Dialog Strategy, III Self-Evolution/DCP, IV Evaluation), the five judging criteria (Technical
 > Execution, Innovation & Insight, Impact & Relevance, Feasibility & Practicality, Presentation), and
 > the four metrics (Hit Rate@10, MRR, MTTC/Efficiency, TechnicalScore). Grounded in
-> [ARCHITECTURE.md](ARCHITECTURE.md) and [DECISIONS.md](DECISIONS.md). **No code was changed in this
+> [architecture.md](../architecture.md) and [DECISIONS.md](DECISIONS.md). **No code was changed in this
 > pass** — the purpose is to decide, with evidence, what to build next.
 >
-> **Baseline (results.json, public 200):** HR 0.995 · MRR 0.887 · MTTC 2.695 · Eff 0.8305 ·
-> **TechnicalScore 0.9298**. Public is **leak-inflated** (§2 of ARCHITECTURE.md). The honest proxy
+> **Historical audit baseline (not the current checkout):** HR 0.995 · MRR 0.887 · MTTC 2.695 · Eff 0.8305 ·
+> **TechnicalScore 0.9298**. Public is **leak-inflated** (see the root `architecture.md`). The honest proxy
 > (`evaluator/robustness.py`, `oracle_leakfree.py`) is the real target: **retrieval recall ~99.2%,
 > honest hit@10 ~74%, ~97% of honest misses are ranking's fault, median mis-ranked target sits at
-> pool rank ~2.** That single finding dominates the prioritization below.
+> pool rank ~2.** That single finding dominates the prioritization below. For the current verified
+> default, use the metrics in the root README and `architecture.md`.
 
 Recommendation classes: **KEEP** (sound, preserve) · **TUNE** (retune values) · **REFACTOR**
 (restructure, same behavior) · **REPLACE** (swap the approach) · **EXPERIMENT** (validate a change

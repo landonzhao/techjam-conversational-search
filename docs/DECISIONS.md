@@ -2,7 +2,7 @@
 
 > Central registry of **every hand-chosen number** in the system: weights, thresholds, gates, cutoffs,
 > top-K values, decay rates, and scoring formulas. Companion to
-> [ARCHITECTURE.md](ARCHITECTURE.md) — that document explains the components; this one accounts for
+> [architecture.md](../architecture.md) — that document explains the components; this one accounts for
 > their tunables.
 >
 > **Origin** classifies where the value came from:

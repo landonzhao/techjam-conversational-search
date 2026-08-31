@@ -42,7 +42,8 @@ def session_metrics(rows, score_fn) -> tuple[float, float]:
 
 
 def main() -> None:
-    rows = [json.loads(l) for l in open(DATA, encoding="utf-8")]
+    with Path(DATA).open(encoding="utf-8") as handle:
+        rows = [json.loads(line) for line in handle]
     sids = sorted({r["sid"] for r in rows})
     # held-out split by SESSION (never split a session across train/test), leak-stratified via sid name
     test_sids = {s for i, s in enumerate(sids) if i % 5 == 0}

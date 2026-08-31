@@ -32,9 +32,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -139,8 +138,6 @@ def build(
     cat = Catalog(catalog_path)
     asin_list: list[str] = json.loads(Path(asins_path).read_text())
     embeddings: np.ndarray = np.load(emb_path)       # (N, 384) normalised
-    n_catalog = len(asin_list)
-
     asin_to_idx: dict[str, int] = {a: i for i, a in enumerate(asin_list)}
     valid_asins = [a for a in cat.products if a in asin_to_idx]
     valid_idx = [asin_to_idx[a] for a in valid_asins]

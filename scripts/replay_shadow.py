@@ -33,7 +33,8 @@ TOP_K = 10
 
 
 def load(path: str) -> list[dict]:
-    return [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+    with Path(path).open(encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
 
 
 def run(path: str, tag: str | None, flags: dict | None = None) -> None:
@@ -105,7 +106,8 @@ def run(path: str, tag: str | None, flags: dict | None = None) -> None:
     # breakdowns
     by = defaultdict(list)
     for r in rows:
-        by[("diff", r["diff"])].append(r); by[("cap", r["cap"])].append(r)
+        by[("diff", r["diff"])].append(r)
+        by[("cap", r["cap"])].append(r)
     print("by difficulty:", {k[1]: round(statistics.fmean(x["rr"] for x in v), 3)
                              for k, v in sorted(by.items()) if k[0] == "diff"})
     miss = [r for r in rows if not r["hit"]]

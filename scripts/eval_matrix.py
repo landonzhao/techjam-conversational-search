@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -35,16 +34,10 @@ from src.agent import Agent
 
 CATALOG = "data/catalog.jsonl"
 
-# Named ranking configs, each a dict of agent attributes to set. Unset floor/gate attrs default off.
+# Named ranking configs, each a dict of current Agent attributes to set.
 CONFIGS = {
-#    "no-floor (pure coverage)": dict(COVERAGE_INFORMATIVE_MIN=0.0, COVERAGE_RETRIEVAL_WEIGHT=0.0,
-#                                     SUPPRESS_POP_ON_PARAPHRASE=False, USE_SATISFACTION_RANKER=False,
-#                                     USE_DUAL_TRACK_RANKER=False),
-#    "disc gate + suppress":     dict(COVERAGE_INFORMATIVE_MIN=0.5, COVERAGE_RETRIEVAL_WEIGHT=2.0,
-#                                     COVERAGE_DISCRIMINATION_PCTL=0.9, SUPPRESS_POP_ON_PARAPHRASE=True,
-#                                     USE_SATISFACTION_RANKER=False, USE_DUAL_TRACK_RANKER=False),
-#    "satisfaction (Phase 1)":   dict(USE_SATISFACTION_RANKER=True, USE_DUAL_TRACK_RANKER=False),
-    "dual-track (P2)":          dict(USE_DUAL_TRACK_RANKER=True),
+    "coverage baseline": dict(USE_SATISFACTION_RANKER=False),
+    "satisfaction current": dict(USE_SATISFACTION_RANKER=True),
 }
 
 # (label, path, default sample size or None for full)
@@ -57,13 +50,8 @@ if Path("data/synthetic_set.jsonl").exists():
 
 
 def apply_config(agent: Agent, cfg: dict) -> None:
-    # reset the floor/gate/satisfaction knobs to a known baseline, then apply the named overrides
-    agent.COVERAGE_INFORMATIVE_MIN = 0.0
-    agent.COVERAGE_RETRIEVAL_WEIGHT = 0.0
-    agent.COVERAGE_DISCRIMINATION_PCTL = 0.9
-    agent.SUPPRESS_POP_ON_PARAPHRASE = False
-    agent.USE_SATISFACTION_RANKER = False
-    agent.USE_DUAL_TRACK_RANKER = False
+    # Reset the compared ranker flag to its committed default before applying each row.
+    agent.USE_SATISFACTION_RANKER = Agent.USE_SATISFACTION_RANKER
     for k, v in cfg.items():
         setattr(agent, k, v)
 
@@ -75,24 +63,18 @@ def set_pop_ablation(agent: Agent, ablate: bool) -> None:
             "coverage_blend": agent.COVERAGE_POP_BLEND,
             "ranking_pop_weight": ranking_mod.POP_WEIGHT,
             "tie_break": ranking_mod.COVERAGE_TIE_BREAK,
-            "satisfaction_pop_weight": agent._satisfaction.pop_weight,
-            "dual_popularity_weight": agent.DUAL_POPULARITY_WEIGHT,
-            "dual_leaky_popularity_weight": agent.DUAL_LEAKY_POPULARITY_WEIGHT,
+            "satisfaction_pop_weight": agent.satisfaction_scorer.pop_weight,
         }
         agent.COVERAGE_POP_BLEND = 0.0
         ranking_mod.POP_WEIGHT = 0.0
         ranking_mod.COVERAGE_TIE_BREAK = "base"   # tie-break -> incoming retrieval order
-        agent._satisfaction.pop_weight = 0.0
-        agent.DUAL_POPULARITY_WEIGHT = 0.0
-        agent.DUAL_LEAKY_POPULARITY_WEIGHT = 0.0
+        agent.satisfaction_scorer.pop_weight = 0.0
     elif hasattr(agent, "_pop_saved"):
         saved = agent._pop_saved
         agent.COVERAGE_POP_BLEND = saved["coverage_blend"]
         ranking_mod.POP_WEIGHT = saved["ranking_pop_weight"]
         ranking_mod.COVERAGE_TIE_BREAK = saved["tie_break"]
-        agent._satisfaction.pop_weight = saved["satisfaction_pop_weight"]
-        agent.DUAL_POPULARITY_WEIGHT = saved["dual_popularity_weight"]
-        agent.DUAL_LEAKY_POPULARITY_WEIGHT = saved["dual_leaky_popularity_weight"]
+        agent.satisfaction_scorer.pop_weight = saved["satisfaction_pop_weight"]
 
 
 def score_row(agent: Agent, rows: list, cat_ids, cats, prods) -> tuple:
@@ -107,7 +89,6 @@ def main() -> None:
     ap.add_argument("--synth-n", type=int, default=None, help="synthetic diagnostic sample size")
     ap.add_argument("--pool-size", type=int, default=200,
                     help="candidate pool size for every mode/config (default: 200)")
-    ap.add_argument("--oracle", action="store_true", help="add retrieval/ranking headroom row")
     args = ap.parse_args()
 
     cat_ids, cats, prods = catalog_index(CATALOG)
@@ -136,16 +117,15 @@ def main() -> None:
             apply_config(agent, cfg)
             cells = []
             for lbl, _, _ in SETS:
-                t0 = time.time()
                 s, h, m, _ = score_row(agent, loaded[lbl], cat_ids, cats, prods)
                 cells.append(f"{s:.4f}/{h:.2f}/{m:.3f}")
             print(f"{name:>26} | " + " | ".join(f"{c:>22}" for c in cells), flush=True)
         set_pop_ablation(agent, False)
 
-    print("\nP0.1 verdict: does 'disc gate + suppress' clear public>=0.928 AND leak-free>=0.50?",
+    print("\nRead the pop-ablated rows as a diagnostic for whether gains come from relevance or fame.",
           flush=True)
-    print("P1 baseline: the pop-ablated leak-free column is the number NeedSatisfactionScorer beats.",
-          flush=True)
+    print("Keep the current satisfaction ranker only while it preserves the public guardrail and "
+          "improves the leak-free set.", flush=True)
 
 
 if __name__ == "__main__":

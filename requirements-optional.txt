@@ -1,0 +1,7 @@
+# Optional semantic retrieval, reranking, Gemini, and LTR tooling.
+# Model weights are downloaded separately on first use and are not committed.
+google-genai>=1,<3
+numpy>=1.26,<3
+python-dotenv>=1,<2
+scikit-learn>=1.4,<2
+sentence-transformers>=3,<6

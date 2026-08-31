@@ -32,11 +32,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from evaluator.local_evaluator import (
-    catalog_index, classify_constraint, coarse_category, intent_card, searchable_text,
+    catalog_index, classify_constraint, coarse_category, searchable_text,
 )
 from evaluator.robustness import _verify_disjoint
 from scripts.build_language_stress_set import (
-    _ANCHOR_TEMPLATES, _RELATIVE, _TEMPLATES, _content_tokens, discriminator, paraphrasable_attrs,
+    _ANCHOR_TEMPLATES, _TEMPLATES, _content_tokens, discriminator, paraphrasable_attrs,
 )
 from scripts.scenario_mix import assert_official_mix, scenario_schedule
 
@@ -164,7 +164,8 @@ def main() -> None:
             fh.write(json.dumps(s, ensure_ascii=False) + "\n")
 
     counts = Counter(s["scenario_type"] for s in sessions)
-    mean = lambda xs: sum(xs) / len(xs) if xs else 0.0
+    def mean(values: list[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
     print(f"wrote {len(sessions)} sessions -> {out}  (leak={args.leak})")
     print(f"distinct categories: {len({s['category_bucket'] for s in sessions})}")
     print("per-pillar count | attribute leak rate:")

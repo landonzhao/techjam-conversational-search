@@ -132,7 +132,10 @@ def main() -> None:
             miss_not_in_pool += 1
 
     misses = n - hits
-    pct = lambda x, d: (100.0 * x / d) if d else 0.0
+
+    def pct(value: int, denominator: int) -> float:
+        return (100.0 * value / denominator) if denominator else 0.0
+
     print(f"ORACLE — honest (leak-free) set, {n} sessions, best ranking config, LLM off", flush=True)
     print(f"avg pool size ~{statistics.mean(pool_sizes):.0f}", flush=True)
     print("-" * 68, flush=True)

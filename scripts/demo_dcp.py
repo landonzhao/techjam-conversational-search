@@ -78,7 +78,7 @@ def print_dcp_state(agent: Agent, session_id: str | None = None, label: str = ""
 
     sess = state.get("session", {})
     if sess:
-        print(f"\nSession state:")
+        print("\nSession state:")
         print(f"  conv_state        = {sess.get('conv_state')}")
         print(f"  belief.confidence = {sess.get('belief_confidence')}")
         print(f"  volatility        = {sess.get('volatility')}")
@@ -108,7 +108,7 @@ def main() -> None:
     print("DCP DEMO — self-evolution across sessions")
     print("=" * 60)
     print(f"\nUser profile: {json.dumps(SIMULATED_USER, indent=None)}")
-    print(f"\nScenario: user consistently waves off COLOR questions.")
+    print("\nScenario: user consistently waves off COLOR questions.")
     print("Watch the guidance weights shift — color waveoff rate rises,")
     print("color gets deprioritised, agent asks more useful questions.\n")
 

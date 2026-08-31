@@ -833,11 +833,14 @@ def missing_required(need: NeedModel) -> list[str]:
 def attr_value(product: dict, slot: str, doc: str, price_q: list[float]) -> str | None:
     """The value of a candidate's attribute, for belief distributions / info-gain."""
     if slot == "material":
-        m = MATERIAL_RE.search(doc); return m.group(1) if m else None
+        match = MATERIAL_RE.search(doc)
+        return match.group(1) if match else None
     if slot == "color":
-        m = COLOR_RE.search(doc); return m.group(1) if m else None
+        match = COLOR_RE.search(doc)
+        return match.group(1) if match else None
     if slot == "style":
-        m = STYLE_RE.search(doc); return m.group(1) if m else None
+        match = STYLE_RE.search(doc)
+        return match.group(1) if match else None
     if slot == "use_case":
         for k in USE_CASE_KEYS:
             if k in doc:

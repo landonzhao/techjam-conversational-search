@@ -466,14 +466,25 @@ class CoverageReranker:
         # Price proximity corroborates the coverage sort without touching the returned score.
         if has_price:
             ranked = {a: ranked[a] + price_weight * self._price_prox(a, budget) for a in asins}
-        if prefer_cat:
-            cm = {a: self._cat_match(a, prefer_cat) for a in asins}
-            key = lambda a: (-ranked[a], -cm[a], -self._pop(a), base_rank[a])
-        elif suppress_pop or COVERAGE_TIE_BREAK == "base":
-            # Paraphrase turn (or configured): break ties on retrieval order, not popularity.
-            key = lambda a: (-ranked[a], base_rank[a])
-        else:  # "pop" — popularity tie-break
-            key = lambda a: (-ranked[a], -self._pop(a), base_rank[a])
+        category_matches = (
+            {asin: self._cat_match(asin, prefer_cat) for asin in asins}
+            if prefer_cat
+            else {}
+        )
+
+        def key(asin: str) -> tuple[float, ...]:
+            if prefer_cat:
+                return (
+                    -ranked[asin],
+                    -category_matches[asin],
+                    -self._pop(asin),
+                    base_rank[asin],
+                )
+            if suppress_pop or COVERAGE_TIE_BREAK == "base":
+                # On paraphrase turns, use retrieval order rather than popularity for ties.
+                return (-ranked[asin], base_rank[asin])
+            return (-ranked[asin], -self._pop(asin), base_rank[asin])
+
         coverage_order = sorted(asins, key=key)
 
         if has_structured and len(asins) > 1:
