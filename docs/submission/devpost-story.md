@@ -106,7 +106,14 @@ message + profile
 
 ## What's next for TokenMaxx Copilot
 
-- Enable the `GuidanceLearner` and MMR diversifier in a live deployment and measure their effect on real conversion rates
-- Run a human-written, target-independent language evaluation and usability study
-- Add a deployment target, session eviction, observability, and concurrency controls
-- Extend the correction-aware state ledger with typed records and broader override tests
+The architecture is ready to move beyond a benchmark. The immediate next steps for a real deployment:
+
+**Turn on the production features.** The MMR diversifier and GuidanceLearner are implemented and tested but disabled for scoring. A live deployment would enable both and instrument them — measuring whether diverse result lists reduce pogo-sticking, and whether the question reweighting actually improves conversion over the first few thousand sessions.
+
+**Replace the simulated evaluator with real users.** The honest set is a proxy, not a substitute. The next real test is a small-scale pilot with actual shoppers — collecting implicit feedback (clicks, add-to-cart, session abandonment) to validate whether MTTC in evaluation maps to conversion rate in practice.
+
+**Solve the cold-start problem properly.** Right now, a new user gets the same question priority order as everyone else until the GuidanceLearner accumulates enough signal. For a real deployment, bootstrapping from category-level purchase data or onboarding questions would meaningfully reduce first-session friction.
+
+**Multi-catalog and multi-category support.** The current pipeline is tuned for one frozen catalog. Extending to a live, updating inventory — with new products, price changes, and retired SKUs — requires an incremental indexing strategy and drift monitoring to catch when the BM25 or embedding index goes stale.
+
+**Privacy and session handling at scale.** The durable profile store is currently a local JSON file with a 45-day decay. Production needs a proper key-value store, a defined data-retention policy, and user-facing controls to view or delete their preference history — especially relevant in markets with strong data protection expectations.
