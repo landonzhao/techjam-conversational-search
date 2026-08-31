@@ -24,6 +24,7 @@ from src.config import (
     PRICE_PROXIMITY_WEIGHT, RERANK_NEAR_TIE_MARGIN, REVEAL_CONFIDENCE, REVEAL_HOLDBACK_K,
     RETRIEVAL_GUARD_K, RETRIEVAL_GUARD_MAX_EXACT, RETRIEVAL_GUARD_VISIBLE_K, USE_RETRIEVAL_GUARD,
     USE_CATEGORY_SWITCH_CLEAR, USE_PROFILE_NEGATION_PURGE,
+    USE_PROFILE_RANKING_FALLBACK, PROFILE_RANKING_STRENGTH,
     SATISFACTION_POP_CHANNEL, SATISFACTION_POP_WEIGHT, SATISFACTION_QUALITY_CHANNEL,
     SATISFACTION_SEM_ALPHA, SATISFACTION_SEM_GATE_HIGH, SATISFACTION_SEM_GATE_LOW,
     SATISFACTION_SPECIFICITY_REF, SATISFACTION_UNKNOWN_FLOOR,
@@ -134,6 +135,8 @@ class Agent:
     # Correction rules: (b) category-switch clears stale modifiers; (c) negation purge from profile.
     USE_CATEGORY_SWITCH_CLEAR = USE_CATEGORY_SWITCH_CLEAR
     USE_PROFILE_NEGATION_PURGE = USE_PROFILE_NEGATION_PURGE
+    USE_PROFILE_RANKING_FALLBACK = USE_PROFILE_RANKING_FALLBACK
+    PROFILE_RANKING_STRENGTH = PROFILE_RANKING_STRENGTH
     # Retrieval guard: force-keep hybrid retrieval's top-K in the visible window on clean turns.
     USE_RETRIEVAL_GUARD = USE_RETRIEVAL_GUARD
     RETRIEVAL_GUARD_K = RETRIEVAL_GUARD_K
@@ -532,16 +535,26 @@ class Agent:
             nl_phrases = True
 
         if self.USE_SATISFACTION_RANKER and rank_phrases:
-            # Alternate ranker (RANKING_REDESIGN.md Phase 1): rank by satisfaction of the disclosed
-            # phrases (verbatim-lexical OR semantic), generalizing coverage. Replaces the coverage
-            # re-sort entirely when on; measured head-to-head via scripts/eval_matrix.py.
-            # On NL-derived (generic regex) phrases, suppress popularity so ties fall back to the
-            # retrieval order — otherwise fame buries a well-retrieved but unpopular target.
+            # Primary ranker: rank by how well candidates satisfy the disclosed phrases.
+            # Lexical + semantic matching generalises over paraphrase. On NL-derived phrases,
+            # popularity is suppressed so retrieval rank acts as the tie-break.
             candidates, cov_scores = self._satisfaction.rank(
                 candidates, rank_phrases, pop_weight=0.0 if nl_phrases else None)
             if self._tracer.enabled:
                 self._tracer.note("satisfaction rerank on phrases: "
                                   + "; ".join(rank_phrases[:6]))
+        elif (self.USE_PROFILE_RANKING_FALLBACK
+              and not rank_phrases
+              and state.user_profile.get("preference_tags")):
+            # Profile ranking fallback: fires when there are no constraint phrases to rank by
+            # (boundary sessions, cold-start turns). Uses the user's preference_tags as a weak
+            # signal — candidates whose text overlaps the tags are promoted. This gives boundary
+            # sessions an actual ranking signal rather than pure retrieval order.
+            candidates, cov_scores = self._rank_by_profile(
+                candidates, state.user_profile["preference_tags"])
+            if self._tracer.enabled:
+                self._tracer.note("profile ranking fallback: tags="
+                                  + str(state.user_profile["preference_tags"][:4]))
         elif self.USE_COVERAGE_RERANK and (
                 rank_phrases or struct_constraints or budget_val is not None):
             prefer_cat = state.need.category if self.USE_CATEGORY_TIEBREAK else None
@@ -852,6 +865,39 @@ class Agent:
             return top_k
         return min(top_k, self.REVEAL_HOLDBACK_K)
 
+    def _rank_by_profile(
+        self,
+        candidates: list[str],
+        preference_tags: list[str],
+    ) -> tuple[list[str], dict[str, float]]:
+        """Rank candidates by overlap with the user's preference_tags when no constraint phrases exist.
+
+        Used as a fallback for boundary sessions and cold-start turns where the constraint
+        phrase list is empty and the satisfaction ranker would no-op. Computes a soft score
+        as a blend of retrieval rank and tag-overlap fraction, preserving retrieval order
+        when no overlap is found (so the fallback cannot hurt non-boundary sessions).
+
+        Returns (ordered_candidates, scores) in the same shape as satisfaction.rank().
+        """
+        from src.catalog import TOKEN_RE, terms as _terms
+        tag_tokens: set[str] = set()
+        for tag in preference_tags:
+            tag_tokens.update(TOKEN_RE.findall(tag.lower()))
+        if not tag_tokens:
+            return candidates, {a: 0.0 for a in candidates}
+
+        base_rank = {a: i for i, a in enumerate(candidates)}
+        n = max(1, len(candidates) - 1)
+        scores: dict[str, float] = {}
+        for asin in candidates:
+            doc_tokens = set(TOKEN_RE.findall(self._coverage.doc(asin).lower()))
+            overlap = len(tag_tokens & doc_tokens) / max(1, len(tag_tokens))
+            retrieval_score = 1.0 - (base_rank[asin] / n)
+            scores[asin] = retrieval_score + self.PROFILE_RANKING_STRENGTH * overlap
+
+        ordered = sorted(candidates, key=lambda a: (-scores[a], base_rank[a]))
+        return ordered, scores
+
     @staticmethod
     def _parse_profile_summary(user_profile: dict) -> set:
         """Extract emphasis terms from user_profile['summary'] for retrieval expansion.
@@ -974,15 +1020,21 @@ class Agent:
     def _retrieve(self, state: ConversationState, pool: int) -> list[str]:
         """Dispatch to intent-specific retrieval track, then fuse the expansion side-track.
 
-        Buying → _retrieve_buying(): BM25-primary, keyword-precise, hard-constraint shaped.
-        Browsing → _retrieve_browsing(): dense-primary, semantic, broader cross-category recall.
-        Mixed → blended weights between the two extremes.
+        Buying   → _retrieve_buying():  BM25-primary, keyword-precise.
+        Browsing → _retrieve_browsing(): dense-primary, semantic cross-category.
+        Mixed/Override → _retrieve_blended(): interpolated by buying_score.
+
+        Retrieval uses state.retrieval_query() rather than the full query_text().
+        After an intent override, retrieval_query() returns only the post-override
+        messages, preventing the old category's vocabulary from contaminating the
+        new intent's embedding and retrieval ranking.
         """
         intent = state.intent
-        query = state.query_text()
+        query = state.retrieval_query()
 
         if self._tracer.enabled:
-            self._tracer.stage("retrieval", query=query, intent=intent)
+            self._tracer.stage("retrieval", query=query, intent=intent,
+                               post_override=(state.override_turn is not None))
 
         if not query.strip():
             return self._catalog.bm25(query, pool)
@@ -1028,12 +1080,20 @@ class Agent:
         Browsing shoppers are exploring; dense semantic search surfaces unexpected matches.
         BM25 is a secondary grounding layer at a lower weight.
         Slot-decayed multi-turn dense encoding lets recent turns dominate when interest shifts.
+        Uses the retrieval query (post-override slice when applicable) not the full history.
         """
         if not (self.USE_VECTOR and self._vector):
             return self._catalog.bm25(query, pool)
+        # Use retrieval_query() text list for decayed search so post-override retrieval
+        # is anchored to the new intent, not the old category's vocabulary.
+        retrieval_text = (
+            state.all_text[state.override_turn - 1:]
+            if state.override_turn is not None and len(state.all_text) >= state.override_turn
+            else state.all_text
+        )
         try:
             if SLOT_DECAY < 1.0:
-                dense_results = self._vector.search_decayed(state.all_text, pool, SLOT_DECAY)
+                dense_results = self._vector.search_decayed(retrieval_text, pool, SLOT_DECAY)
             else:
                 dense_results = self._vector.search(query, pool)
         except Exception:
@@ -1061,9 +1121,14 @@ class Agent:
         else:
             w = vector_weight(state.buying_score, self.USE_INTENT_ROUTING,
                               self.USE_CONFIDENCE_ROUTING)
+        retrieval_text = (
+            state.all_text[state.override_turn - 1:]
+            if state.override_turn is not None and len(state.all_text) >= state.override_turn
+            else state.all_text
+        )
         try:
             if SLOT_DECAY < 1.0:
-                dense_results = self._vector.search_decayed(state.all_text, pool, SLOT_DECAY)
+                dense_results = self._vector.search_decayed(retrieval_text, pool, SLOT_DECAY)
             else:
                 dense_results = self._vector.search(query, pool)
         except Exception:

@@ -120,7 +120,24 @@ class ConversationState:
         self.all_text.append(message)
 
     def query_text(self) -> str:
+        """Full conversation history as a single string (used for context, slot extraction)."""
         return " ".join(self.all_text)
+
+    def retrieval_query(self) -> str:
+        """Query string used for retrieval — differs from query_text() after an intent override.
+
+        After an override, the pre-override messages are stale: they anchor dense retrieval to
+        the old category's vocabulary and contaminate the new intent's embedding. Retrieval uses
+        only the post-override messages so the new intent is represented cleanly.
+
+        Preserves the full all_text for dialogue context, slot extraction, and LLM calls.
+        """
+        if self.override_turn is not None and len(self.all_text) >= self.override_turn:
+            # override_turn is 1-indexed (turn number), all_text is 0-indexed messages
+            post_override = self.all_text[self.override_turn - 1:]
+            if post_override:
+                return " ".join(post_override)
+        return self.query_text()
 
 
 def phase_transition(

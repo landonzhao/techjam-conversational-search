@@ -278,6 +278,13 @@ USE_CATEGORY_SWITCH_CLEAR: bool = True   # CORE — only fires on confirmed over
 # Rule (c) negation purge from profile — off by default (safe but low measurable impact on evals
 # since public/private users don't share profile state). On for real user deployments.
 USE_PROFILE_NEGATION_PURGE: bool = True  # OPTIONAL — mask retired profile tags this session
+
+# Profile-weighted ranking fallback for constraint-sparse turns (boundary sessions).
+# When rank_phrases is empty and the user profile has preference_tags, apply a lightweight
+# tag-overlap score so boundary sessions have a signal beyond raw retrieval order.
+USE_PROFILE_RANKING_FALLBACK: bool = True   # CORE — improves boundary + cold-start ranking
+PROFILE_RANKING_STRENGTH: float = 0.15      # blend: final = sat + STRENGTH * tag_overlap
+
 LLM_RERANK_DEPTH: int = 20
 LLM_WEIGHT: float = 0.3
 LLM_MODEL: str = "gemini-flash-lite-latest"

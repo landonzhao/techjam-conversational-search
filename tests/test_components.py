@@ -558,6 +558,90 @@ class SatisfactionScorerTest(unittest.TestCase):
         self.assertAlmostEqual(sat["B"], 0.0)
 
 
+class OverrideRetrievalQueryTest(unittest.TestCase):
+    """ConversationState.retrieval_query() isolates post-override messages."""
+
+    def _state(self):
+        from src.dialogue import ConversationState
+        return ConversationState(user_profile={})
+
+    def test_no_override_returns_full_history(self):
+        s = self._state()
+        s.all_text = ["I need a jacket", "make it waterproof"]
+        self.assertEqual(s.retrieval_query(), "I need a jacket make it waterproof")
+
+    def test_override_returns_only_post_override_messages(self):
+        s = self._state()
+        s.all_text = ["I need a jacket", "blue please", "actually forget that, show me boots"]
+        s.override_turn = 3  # override happened on turn 3
+        # retrieval_query should only include from index 2 onward (0-indexed)
+        self.assertIn("boots", s.retrieval_query())
+        self.assertNotIn("jacket", s.retrieval_query())
+
+    def test_override_turn_1_uses_first_message(self):
+        s = self._state()
+        s.all_text = ["actually show me sandals"]
+        s.override_turn = 1
+        self.assertEqual(s.retrieval_query(), "actually show me sandals")
+
+    def test_query_text_unchanged_after_override(self):
+        # query_text() must still return full history (used for slot extraction, LLM)
+        s = self._state()
+        s.all_text = ["I need a jacket", "blue", "actually show me boots"]
+        s.override_turn = 3
+        self.assertIn("jacket", s.query_text())
+        self.assertIn("boots", s.query_text())
+
+
+class ProfileRankingFallbackTest(unittest.TestCase):
+    """_rank_by_profile: raises tag-matching candidates on empty-constraint turns."""
+
+    def _setup(self, catalog=None):
+        from tests.test_components import AgentSmokeTest  # reuse catalog fixture
+        import tempfile, json, pathlib
+        if catalog is None:
+            catalog = {
+                "LEATHER": {"title": "genuine leather belt", "features": "durable quality"},
+                "COTTON":  {"title": "soft cotton shirt", "features": "comfortable casual"},
+                "PLAIN":   {"title": "plain item", "features": "basic product"},
+            }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl",
+                                        delete=False, encoding="utf-8") as f:
+            for asin, prod in catalog.items():
+                prod["parent_asin"] = asin
+                f.write(json.dumps(prod) + "\n")
+            path = f.name
+        from src.agent import Agent
+        Agent.USE_VECTOR = False
+        Agent.USE_LLM_SLOTS = False
+        Agent.USE_LLM_INFERENCE = False
+        return Agent(path), path
+
+    def test_tag_matching_candidate_promoted(self):
+        agent, _ = self._setup()
+        # 4 candidates: LEATHER is at retrieval rank 3 (worst), PLAIN at rank 0 (best).
+        # With strength=2.0, tag overlap bonus (2.0) > retrieval gap (1.0 - 0.0 = 1.0),
+        # so LEATHER should outscore PLAIN despite being last in retrieval order.
+        agent.PROFILE_RANKING_STRENGTH = 2.0
+        tags = ["leather", "durable"]
+        candidates = ["PLAIN", "COTTON", "BASIC", "LEATHER"]
+        ordered, scores = agent._rank_by_profile(candidates, tags)
+        self.assertGreater(scores["LEATHER"], scores["PLAIN"],
+                           "LEATHER (full tag overlap) should outscore PLAIN (no overlap)")
+
+    def test_no_tags_preserves_retrieval_order(self):
+        agent, _ = self._setup()
+        candidates = ["PLAIN", "COTTON", "LEATHER"]
+        ordered, scores = agent._rank_by_profile(candidates, [])
+        self.assertEqual(ordered, candidates)
+
+    def test_scores_non_negative(self):
+        agent, _ = self._setup()
+        ordered, scores = agent._rank_by_profile(
+            ["PLAIN", "COTTON", "LEATHER"], ["comfort", "soft"])
+        self.assertTrue(all(v >= 0 for v in scores.values()))
+
+
 class RetrievalGuardTest(unittest.TestCase):
     """guard_retrieval_head: force-keep retrieval top-K in visible window."""
 
