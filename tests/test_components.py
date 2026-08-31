@@ -416,6 +416,24 @@ class AgentSmokeTest(unittest.TestCase):
         self.assertIn("A", catalog)
         self.assertEqual(catalog["A"]["title"], "waterproof leather hiking boot")
 
+    def test_bm25_only_path_does_not_apply_slot_expansion(self):
+        state = self.agent._sessions["sess"]
+        original_expand = self.agent._expansion.expand
+        original_vector = self.agent._vector
+        original_flag = self.agent.USE_VECTOR
+        self.agent._expansion.expand = lambda _need: (_ for _ in ()).throw(
+            AssertionError("slot expansion must stay off on the BM25-only fallback")
+        )
+        self.agent._vector = None
+        self.agent.USE_VECTOR = False
+        try:
+            result = self.agent._apply_expansion(state, "jacket", ["A", "B"], 2)
+            self.assertEqual(result, ["A", "B"])
+        finally:
+            self.agent._expansion.expand = original_expand
+            self.agent._vector = original_vector
+            self.agent.USE_VECTOR = original_flag
+
     def test_reset_clears_session(self):
         self.agent.respond("sess", "warm jacket", 1, 5)
         self.agent.reset("sess", {})

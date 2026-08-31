@@ -1302,7 +1302,12 @@ class Agent:
         if not self.USE_NEED_MODEL:
             return fused
         expansion_terms: set[str] = set()
-        if self.USE_SLOT_EXPANSION:
+        # Keep the vector-disabled fallback behavior coherent with the validated repair: pure
+        # BM25 must not be reordered by the generic slot/synonym side-track.  Moving expansion
+        # outside the hybrid branch during the origin/main integration made a leak-free browsing
+        # target fall from rank 1 to rank 2, where adaptive reveal hid it.  Use-case priors remain
+        # independent and active below; only the regressing BM25-only slot expansion is restored.
+        if self.USE_SLOT_EXPANSION and self.USE_VECTOR and self._vector is not None:
             expansion_terms |= self._expansion.expand(state.need)
             expansion_terms |= {c.value for c in state.need.positives()}
             expansion_terms |= self._expansion.expand_text(query)
