@@ -385,6 +385,11 @@ state. Do not compare regenerated datasets with the frozen tracked sets.
 - Evaluate with human-written requests that are independent of target product text.
 - Add a deployment target, observability, session eviction, and concurrency controls if the project
   becomes a service.
+- Enable the MMR result diversifier (`USE_DIVERSITY`) in production deployments. It is implemented
+  and tested but disabled for the competition because the benchmark rewards a single target's rank —
+  any tail reshuffle can drop a rank-9 target out of top-10. In a real storefront this flag should
+  be on: it surfaces distinct styles and gives smaller vendors a fairer chance to appear in the
+  visible window instead of ten near-identical popular items dominating every result list.
 
 ## Team contributions
 

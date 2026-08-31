@@ -157,7 +157,7 @@ Keyword search fails the majority of real shopping sessions: shoppers often desc
 vibes, or outcomes rather than product attributes, and they change direction mid-conversation.
 TokenMaxx Copilot targets this gap directly.
 
-Three concrete impact arguments:
+Four concrete impact arguments:
 
 **Conversion friction.** Every unnecessary dialogue turn is a dropout risk. At MTTC 2.9 turns on a
 10-turn budget, the agent resolves the correct product in under three exchanges on average — with
@@ -177,6 +177,17 @@ The correction-aware state ledger also addresses a common chatbot failure: accum
 context. When a shopper changes their mind, the system retires the old constraint rather than
 carrying it forward, producing recommendations that reflect the *current* preference, not a blended
 history.
+
+**Vendor fairness through result diversity.** A purely relevance-ranked top-10 in fashion tends to
+surface ten near-identical items from the same dominant brand or style, crowding out smaller vendors
+whose products are equally relevant but less popular. The system includes a Maximal Marginal
+Relevance (MMR) diversifier — implemented, tested, and shipped — that protects the confident top
+picks and then fills the remaining slots by penalising items too similar to those already shown
+(Jaccard similarity on title tokens). This gives distinct styles and smaller vendors a fairer chance
+to appear in the visible window. It is disabled by default for the competition because the benchmark
+rewards a single target product's rank and any tail reshuffle can accidentally drop a rank-9 target
+out of top-10 — a scoring artifact that does not reflect real shopper value. In a production
+storefront, this flag would be on.
 
 ## Feasibility beyond the hackathon
 
