@@ -570,19 +570,24 @@ class OverrideRetrievalQueryTest(unittest.TestCase):
         s.all_text = ["I need a jacket", "make it waterproof"]
         self.assertEqual(s.retrieval_query(), "I need a jacket make it waterproof")
 
-    def test_override_returns_only_post_override_messages(self):
+    def test_override_skips_override_phrase_uses_post_override_content(self):
+        # Override on turn 3: all_text=[t1, t2, override_phrase, t4_new_constraint]
+        # retrieval_query should use all_text[3:] = [t4_new_constraint] only
         s = self._state()
-        s.all_text = ["I need a jacket", "blue please", "actually forget that, show me boots"]
-        s.override_turn = 3  # override happened on turn 3
-        # retrieval_query should only include from index 2 onward (0-indexed)
-        self.assertIn("boots", s.retrieval_query())
-        self.assertNotIn("jacket", s.retrieval_query())
+        s.all_text = ["I need a jacket", "blue please",
+                      "actually forget that", "show me boots for hiking"]
+        s.override_turn = 3  # override_turn=3 → slice at index 3
+        query = s.retrieval_query()
+        self.assertIn("boots", query)
+        self.assertNotIn("jacket", query)
+        self.assertNotIn("actually forget", query)  # override phrase excluded
 
-    def test_override_turn_1_uses_first_message(self):
+    def test_override_turn_on_same_turn_falls_back_to_full_history(self):
+        # On the override turn itself, no post-override content yet → full history
         s = self._state()
-        s.all_text = ["actually show me sandals"]
-        s.override_turn = 1
-        self.assertEqual(s.retrieval_query(), "actually show me sandals")
+        s.all_text = ["I need a jacket", "blue please", "actually forget that"]
+        s.override_turn = 3  # all_text[3:] = [] → falls back
+        self.assertIn("jacket", s.retrieval_query())  # full history used
 
     def test_query_text_unchanged_after_override(self):
         # query_text() must still return full history (used for slot extraction, LLM)

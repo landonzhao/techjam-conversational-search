@@ -124,18 +124,25 @@ class ConversationState:
         return " ".join(self.all_text)
 
     def retrieval_query(self) -> str:
-        """Query string used for retrieval — differs from query_text() after an intent override.
+        """Query string for retrieval — post-override slice when meaningful content exists.
 
-        After an override, the pre-override messages are stale: they anchor dense retrieval to
-        the old category's vocabulary and contaminate the new intent's embedding. Retrieval uses
-        only the post-override messages so the new intent is represented cleanly.
+        After an intent override, the pre-override messages contaminate dense retrieval with
+        the old category's vocabulary. However, the override message itself is often content-free
+        (e.g. "Actually, please ignore my earlier preference."), so the slice only activates on
+        the turn AFTER the override — once the first post-override constraint has arrived.
 
-        Preserves the full all_text for dialogue context, slot extraction, and LLM calls.
+        Indexing:
+          override_turn=N (1-indexed), all_text is 0-indexed.
+          The override message is at all_text[N-1].
+          Post-override content starts at all_text[N] (index N, 0-based).
+          We wait until len(all_text) > N so at least one constraint-bearing message exists.
+
+        Preserves query_text() (full history) for slot extraction, LLM context, and the
+        override turn itself.
         """
-        if self.override_turn is not None and len(self.all_text) >= self.override_turn:
-            # override_turn is 1-indexed (turn number), all_text is 0-indexed messages
-            post_override = self.all_text[self.override_turn - 1:]
-            if post_override:
+        if self.override_turn is not None:
+            post_override = self.all_text[self.override_turn:]  # skip the override phrase itself
+            if post_override:  # at least one message after the override turn
                 return " ".join(post_override)
         return self.query_text()
 
