@@ -266,24 +266,46 @@ class ExecutionPlan:
 class OrchestrationPolicy:
     """Emits a per-turn ExecutionPlan: routes, weights, pool size, and rerank order.
 
-    Default values reproduce the static pipeline exactly (same interpolation, pool=200,
-    personalization then coverage-last), so enabling this is score-neutral.
+    The plan adapts based on the accumulated session context, buying score, and convergence state.
+    PROBE phase: wide pool, expansion-heavy for recall.
+    CONFIRM phase: tighter pool, reranker-heavy for precision.
+    DELIVER phase: minimal pool, fast path.
     """
 
     DENSE_BUYING = 0.20
     DENSE_BROWSING = 0.35
-    BASE_POOL = 200
     EXPANSION_WEIGHT = 0.10
+
+    # Phase-specific pool sizes (wider early, tighter late)
+    POOL_PROBE = 200
+    POOL_CONFIRM = 150
+    POOL_DELIVER = 100
 
     def plan(self, ctx: SessionContext, buying_score: float, conv_state: str,
              ask_slot: str | None, warm: bool) -> ExecutionPlan:
         dense = self.DENSE_BROWSING + buying_score * (self.DENSE_BUYING - self.DENSE_BROWSING)
+
+        # Phase-adaptive pool: wider during exploration, tighter once converging
+        if conv_state == "DELIVER":
+            pool = self.POOL_DELIVER
+            rerank_stack = ["satisfaction", "cross_encoder"]
+        elif conv_state == "CONFIRM":
+            pool = self.POOL_CONFIRM
+            rerank_stack = ["satisfaction", "cross_encoder"]
+        else:  # PROBE / explore
+            pool = self.POOL_PROBE
+            rerank_stack = ["personalization", "satisfaction"]
+
+        # Warm sessions (known user profile) use a tighter pool — profile already narrows candidates
+        if warm and conv_state == "PROBE":
+            pool = min(pool, 150)
+
         weights = {"dense": dense, "expansion": self.EXPANSION_WEIGHT}
         return ExecutionPlan(
             routes=["bm25", "dense", "expansion"],
             route_weights=weights,
-            pool_size=self.BASE_POOL,
-            rerank_stack=["personalization", "coverage"],
+            pool_size=pool,
+            rerank_stack=rerank_stack,
             dialogue_action=conv_state,
             ask_slot=ask_slot,
         )

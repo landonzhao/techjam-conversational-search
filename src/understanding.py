@@ -144,7 +144,7 @@ class NeedModel:
     constraints: list[Constraint] = field(default_factory=list)
     category: str | None = None
 
-    def revise(self, new: list[Constraint]) -> None:
+    def revise(self, new: list[Constraint], is_override: bool = False) -> None:
         """Non-monotonic merge (DST selective-overwrite) with surgical correction rules.
 
         A new constraint on the same (slot, value) supersedes the old one (newer turn wins), so
@@ -155,12 +155,12 @@ class NeedModel:
 
         Rule (a) — same-turn negation wins: when a positive and negative for the same (slot, value)
         arrive in the same batch (e.g. 'polyester instead of linen'), the negative takes precedence
-        and the positive is dropped before any constraint is committed. Bryan's key insight: a
-        fallback extractor must not resurrect a value the shopper just rejected.
+        and the positive is dropped before any constraint is committed.
 
-        Rule (b) — category-switch retires stale modifiers: when the category slot changes, positive
-        non-category constraints from prior turns are cleared, because a shopper who switches from
-        'boots' to 'sandals' no longer wants the boot-specific material/color.
+        Rule (b) — category-switch retires stale modifiers (only when is_override=True): when the
+        router has confirmed an explicit intent override and the category changes, positive non-category
+        constraints from prior turns are cleared. Gated on is_override because spurious parser
+        category-parses on normal turns caused boundary MTTC regression (+2.5 turns).
         """
         # Rule (a): resolve all same-turn negations before applying positives.
         # Build the set of (slot, value) pairs explicitly negated in this batch.
@@ -182,11 +182,10 @@ class NeedModel:
                     x for x in self.constraints
                     if not (x.slot == c.slot and x.polarity > 0)]
 
-            # Rule (b): category-switch retires prior-turn modifiers (gated by USE_CATEGORY_SWITCH_CLEAR).
-            # Correct for real sessions but regressed public boundary MTTC (+2.5 turns) because the
-            # evaluator's verbatim disclosures can trigger spurious category parses, clearing valid
-            # constraints. Off by default until measured on the honest intent-override/boundary sets.
-            if (USE_CATEGORY_SWITCH_CLEAR
+            # Rule (b): category-switch retires prior-turn modifiers — only on confirmed override turns.
+            # Gated on is_override so normal turns (where the parser may spuriously extract a category
+            # token) never clear valid constraints. USE_CATEGORY_SWITCH_CLEAR can further disable it.
+            if (USE_CATEGORY_SWITCH_CLEAR and is_override
                     and c.slot == "category" and c.polarity > 0
                     and self.category and self.category != c.value):
                 new_turn = c.turn
@@ -505,322 +504,25 @@ def attr_value(product: dict, slot: str, doc: str, price_q: list[float]) -> str 
     return None
 
 
-@dataclass
-class Belief:
-    """The agent's explicit, inspectable model of the need + its own confidence."""
-    top_asin: str | None = None
-    margin: float = 0.0
-    entropy: float = 0.0
-    stable_turns: int = 0
-    category: str | None = None
-    item_confidence: float = 0.0
-    need_confidence: float = 0.0
-    confidence: float = 0.0
-    attr_uncertainty: dict[str, float] = field(default_factory=dict)
-
-    def describe(self) -> str:
-        unc = " ".join(f"{s}:{u:.2f}" for s, u in self.attr_uncertainty.items())
-        return (f"conf={self.confidence:.2f} (item={self.item_confidence:.2f} "
-                f"need={self.need_confidence:.2f}) top={self.top_asin} "
-                f"margin={self.margin:.2f} stable={self.stable_turns} cat={self.category} "
-                f"| uncertainty[{unc}]")
 
 
-class BeliefModel:
-    """Turns the ranked pool + scores into an attribute-level belief over the need."""
+# ---------------------------------------------------------------------------
+# Backward-compatible re-exports from src.belief
+# These names were previously defined here; they now live in src/belief.py.
+# Import from src.belief directly in new code.
+from src.belief import (  # noqa: E402
+    Belief, BeliefModel, converge,
+    QuestionSelector, RationaleBuilder,
+    apply_negatives, apply_category_gate,
+)
 
-    TOPN = 20
-
-    def __init__(self, catalog: dict[str, dict], doc_fn, vocab: CatalogVocab) -> None:
-        self.catalog = catalog
-        self.doc = doc_fn
-        self.price_q = vocab.price_quantiles
-
-    def _modal_category(self, head: list[str]) -> str | None:
-        counts: Counter[str] = Counter()
-        for a in head:
-            cats = self.catalog.get(a, {}).get("categories") or []
-            if cats:
-                counts[_norm(str(cats[-1]))] += 1
-        return counts.most_common(1)[0][0] if counts else None
-
-    def update(self, order: list[str], scores: dict[str, float],
-               need: NeedModel, prev: Belief | None) -> Belief:
-        head = order[:self.TOPN]
-        vals = [max(scores.get(a, 0.0), 0.0) for a in head]
-        s0 = vals[0] if vals else 0.0
-        margin = (s0 - vals[-1]) / s0 if s0 > 0 else 0.0
-        tot = sum(vals)
-        ent = 0.0
-        if tot > 0:
-            ps = [v / tot for v in vals if v > 0]
-            if len(ps) > 1:
-                ent = -sum(p * math.log(p) for p in ps) / math.log(len(ps))
-        top = head[0] if head else None
-        stable = (prev.stable_turns + 1) if (prev and top and prev.top_asin == top) else 0
-
-        cat = need.category or self._modal_category(head)
-        req = REQUIRED_SLOTS.get(coarse_category(cat) or "", DEFAULT_REQ)
-        miss = [s for s in req if not need.has_positive(s)]
-        attr_unc: dict[str, float] = {}
-        for slot in miss:
-            counts: Counter[str] = Counter()
-            for a in head:
-                v = attr_value(self.catalog.get(a, {}), slot, self.doc(a), self.price_q)
-                if v:
-                    counts[v] += 1
-            if counts:
-                t = sum(counts.values())
-                ps = [c / t for c in counts.values()]
-                u = -sum(p * math.log(p) for p in ps) / math.log(len(ps)) if len(ps) > 1 else 0.0
-                attr_unc[slot] = max(u, 0.5)      # required-but-unknown stays askable
-            else:
-                attr_unc[slot] = 1.0
-
-        need_conf = 1.0 - (sum(attr_unc.values()) / len(attr_unc) if attr_unc else 0.0)
-        item_conf = (BELIEF_MARGIN_WEIGHT * margin
-                     + BELIEF_ENTROPY_WEIGHT * (1.0 - ent)
-                     + BELIEF_STABILITY_WEIGHT * min(stable / 2.0, 1.0))
-        conf = min(item_conf, need_conf)
-        return Belief(top, margin, ent, stable, cat, item_conf, need_conf, conf, attr_unc)
-
-
-def converge(belief: Belief, missing: list[str], turn: int, last_turn: int = 10) -> str:
-    """Return DELIVER, CONFIRM, or PROBE based on current belief and turn."""
-    if belief.confidence >= CONVERGE_HIGH or turn >= last_turn:
-        return "DELIVER"
-    if belief.item_confidence >= CONVERGE_MID and not missing:
-        return "CONFIRM"
-    return "PROBE"
-
-
-# Slot decision weights: how much resolving each slot narrows the candidate pool.
-DECISION_WEIGHT = {"budget": 1.3, "size": 1.2, "material": 1.1, "use_case": 1.0,
-                   "category": 1.0, "style": 0.9, "color": 0.8}
-
-# Adaptive clarification (QuestionSelector, USE_ADAPTIVE_CLARIFY). Slots whose values `attr_value`
-# can extract, so `_top_values(head, slot)` being empty means the pool cannot answer that question.
-_EXTRACTED_SLOTS = {"material", "color", "style", "use_case", "size"}
-_WORD_RE = re.compile(r"[a-z0-9]+")
-# Generic, non-discriminating tokens excluded from the pool-derived feature facet.
-_FACET_STOP = {
-    "with", "and", "for", "the", "this", "that", "from", "your", "you", "our", "are", "all",
-    "womens", "women", "mens", "men", "kids", "girls", "boys", "unisex", "size", "sizes",
-    "small", "medium", "large", "pack", "set", "pair", "new", "style", "fashion", "quality",
-    "premium", "classic", "made", "design", "designed", "perfect", "great", "features", "product",
-    "material", "color", "colors", "available", "please", "will", "can", "has", "have",
-}
-
-
-class QuestionSelector:
-    """Component A — ask the question that most reduces the belief's uncertainty (PROBE),
-    verifies the top hypothesis (CONFIRM), or steps aside (DELIVER). Pool-aware phrasing."""
-
-    adaptive_clarify = False   # set by Agent from config.USE_ADAPTIVE_CLARIFY
-
-    def __init__(self, catalog: dict[str, dict], doc_fn, price_q: list[float]) -> None:
-        self.catalog = catalog
-        self.doc = doc_fn
-        self.price_q = price_q
-
-    def select(self, belief: Belief, need: NeedModel, conv_state: str,
-               head: list[str], guidance: dict[str, float] | None = None) -> tuple[str | None, str]:
-        if conv_state == "DELIVER":
-            return None, "Here are the closest matches based on what you've told me."
-        if conv_state == "CONFIRM" and belief.top_asin:
-            attr = self._distinctive_attr(belief.top_asin, head)
-            if attr:
-                return attr, self._confirm_phrase(attr, belief.top_asin)
-        # When top candidates are nearly tied, a product comparison question is more
-        # discriminating than asking about an abstract attribute.
-        if belief.margin < COMPARISON_MARGIN and len(head) >= 2:
-            cmp = self._comparison_phrase(head)
-            if cmp:
-                return "other", cmp
-        # guidance multiplier is per-slot learned info-gain weight (1.0 when unseen)
-        unc = dict(belief.attr_uncertainty)
-        facet_word: str | None = None
-        if self.adaptive_clarify:
-            # (a) drop structured slots the candidate pool has no values for — asking them cannot
-            # discriminate and just burns a turn (a common leak-free/long-tail failure).
-            unc = {s: u for s, u in unc.items()
-                   if s not in _EXTRACTED_SLOTS or self._top_values(head, s)}
-            # (b) add a pool-derived `feature` facet so feature-classified constraints are askable.
-            if not need.has_positive("feature"):
-                facet = self._feature_facet(head, need)
-                if facet:
-                    facet_word, unc["feature"] = facet[0], facet[1]
-        if unc:
-            g = guidance or {}
-            attr = max(unc, key=lambda s: unc[s] * DECISION_WEIGHT.get(s, 1.0) * g.get(s, 1.0))
-            if attr == "feature" and facet_word:
-                return "feature", f"Any particular feature that matters — like {facet_word}?"
-            return attr, self._probe_phrase(attr, head)
-        return "other", "Is there a specific detail that matters most to you?"
-
-    def _feature_facet(self, head: list[str], need: NeedModel) -> tuple[str, float] | None:
-        """The distinctive token the top candidates most SPLIT on — a facet (waterproof, padded,
-        stone type, closure...) that the fixed structured slots don't capture. Pool-derived, so it is
-        category-adaptive and needs no hand-maintained map. Returns (token, strength) where strength
-        peaks at a 50/50 split (maximal information gain). None if nothing splits the pool."""
-        pool = head[:12]
-        if len(pool) < 4:
-            return None
-        known = {t for c in need.positives() for t in _WORD_RE.findall(c.value.lower())}
-        docs = [set(_WORD_RE.findall(self.doc(a))) for a in pool]
-        counts: Counter[str] = Counter()
-        for d in docs:
-            counts.update(t for t in d if len(t) > 3 and t not in _FACET_STOP and t not in known)
-        n = len(pool)
-        best: tuple[str, float] | None = None
-        for tok, c in counts.items():
-            if c < 2 or c > n - 2:                 # present in ~half → discriminating
-                continue
-            frac = c / n
-            strength = 1.0 - abs(0.5 - frac) * 2.0   # 1.0 at 50/50, 0 at all/none
-            if strength >= 0.5 and (best is None or strength > best[1]):
-                best = (tok, strength)
-        return best
-
-    # ---- phrasing (fills specifics from the actual candidate head) ----
-    def _top_values(self, head: list[str], slot: str, n: int = 3) -> list[str]:
-        counts: Counter[str] = Counter()
-        for a in head:
-            v = attr_value(self.catalog.get(a, {}), slot, self.doc(a), self.price_q)
-            if v:
-                counts[v] += 1
-        return [v for v, _ in counts.most_common(n)]
-
-    def _price_range(self, head: list[str]) -> tuple[float, float] | None:
-        prices = []
-        for a in head:
-            try:
-                prices.append(float(self.catalog.get(a, {}).get("price")))
-            except (TypeError, ValueError):
-                pass
-        return (min(prices), max(prices)) if prices else None
-
-    def _probe_phrase(self, attr: str, head: list[str]) -> str:
-        if attr == "budget":
-            pr = self._price_range(head)
-            if pr:
-                return f"These range from ${pr[0]:.0f} to ${pr[1]:.0f} — do you have a budget in mind?"
-            return "What's your budget?"
-        if attr in ("color", "material", "style"):
-            vals = self._top_values(head, attr)
-            if vals:
-                return f"I'm seeing {', '.join(vals)} — any {attr} preference?"
-            return {"color": "Any color preference?", "material": "Any material preference?",
-                    "style": "What style are you after?"}[attr]
-        if attr == "category":
-            cats = self._top_values(head, "category") or []
-            if len(cats) >= 2:
-                return f"Are you leaning toward {cats[0]} or {cats[1]}?"
-            return "What type of item are you after?"
-        if attr == "size":
-            return "What size do you need?"
-        if attr == "use_case":
-            return "What will you mainly use it for?"
-        return "Is there a specific detail that matters most to you?"
-
-    def _distinctive_attr(self, top: str, head: list[str]) -> str | None:
-        runners = [a for a in head if a != top][:5]
-        for slot in ("material", "color", "style", "category"):
-            tv = attr_value(self.catalog.get(top, {}), slot, self.doc(top), self.price_q)
-            if not tv:
-                continue
-            rvs = [attr_value(self.catalog.get(r, {}), slot, self.doc(r), self.price_q) for r in runners]
-            if any(rv and rv != tv for rv in rvs):
-                return slot
-        return None
-
-    def _confirm_phrase(self, attr: str, top: str) -> str:
-        tv = attr_value(self.catalog.get(top, {}), attr, self.doc(top), self.price_q)
-        return f"The closest match is {tv} — is that what you want, or something different?"
-
-    def _comparison_phrase(self, head: list[str]) -> str | None:
-        """When top candidates are nearly tied, ask a direct product comparison question.
-
-        More discriminating than abstract attribute questions when the top-2 differ on
-        multiple dimensions simultaneously — the shopper names their preference directly.
-        """
-        a1, a2 = head[0], head[1]
-        t1 = str(self.catalog.get(a1, {}).get("title") or "")
-        t2 = str(self.catalog.get(a2, {}).get("title") or "")
-        if not t1 or not t2 or t1[:40] == t2[:40]:
-            return None
-        p1 = self.catalog.get(a1, {}).get("price")
-        p2 = self.catalog.get(a2, {}).get("price")
-        desc1 = f"{t1[:50]}" + (f" (${p1:.0f})" if p1 else "")
-        desc2 = f"{t2[:50]}" + (f" (${p2:.0f})" if p2 else "")
-        return f"Are you looking for something more like '{desc1}' or '{desc2}'?"
-
-
-class RationaleBuilder:
-    """Builds a short "why this matches" string from constraints the top candidate satisfies."""
-
-    def __init__(self, catalog: dict[str, dict], doc_fn) -> None:
-        self.catalog = catalog
-        self.doc = doc_fn
-
-    def _within_budget(self, asin: str, value: str) -> bool:
-        m = re.search(r"(\d+)", value)
-        if not m:
-            return False
-        try:
-            return float(self.catalog.get(asin, {}).get("price")) <= float(m.group(1))
-        except (TypeError, ValueError):
-            return False
-
-    def build(self, asin: str, need: NeedModel) -> str:
-        doc = self.doc(asin)
-        hits: list[str] = []
-        for c in need.positives():
-            if c.slot == "category":
-                continue                                   # implied by the result itself
-            if c.slot == "budget":
-                if self._within_budget(asin, c.value):
-                    hits.append(c.value.replace("under ", "under $").replace("around ", "around $"))
-                continue
-            if c.value and all(tok in doc for tok in c.value.split()):
-                hits.append(c.value)
-        seen: list[str] = []
-        for h in hits:
-            if h not in seen:
-                seen.append(h)
-        return "matches " + ", ".join(seen[:4]) if seen else ""
-
-
-def apply_negatives(candidates: list[str], need: NeedModel, doc_fn) -> list[str]:
-    """Demote avoid-constraint violators to the back without dropping any candidates."""
-    negs = [c.value for c in need.negatives() if c.value]
-    if not negs or not candidates:
-        return candidates
-    keep, drop = [], []
-    for asin in candidates:
-        text = doc_fn(asin)
-        (drop if any(v in text for v in negs) else keep).append(asin)
-    return keep + drop
-
-
-def apply_category_gate(
-    candidates: list[str], need_category: str | None, catalog: dict[str, dict]
-) -> list[str]:
-    """Hard-constraint (category) gate: demote candidates whose OWN title resolves to a different
-    canonical category than the confidently-known need category. Stable, non-destructive (violators
-    go to the back, never dropped — so a mis-resolution can't lose the target from the pool).
-
-    Rationale (research: hard constraints applied before ranking, confidence-gated — GenFacet /
-    relevance filtering): a semantically similar but categorically wrong lookalike (a boot when the
-    shopper revised to a sandal) should not outrank the right category. Confidence gate = we only act
-    when BOTH the need category and the candidate's own title category resolve to known buckets AND
-    they differ; unknown/ambiguous candidate categories are left in place (never demoted on a guess).
-    """
-    if not need_category or not candidates:
-        return candidates
-    keep, demote = [], []
-    for asin in candidates:
-        title = text(catalog.get(asin, {}).get("title")).lower()
-        cand_cat = resolve_category(title)
-        (demote if (cand_cat and cand_cat != need_category) else keep).append(asin)
-    return keep + demote
+__all__ = [
+    # NLU core
+    "Constraint", "NeedModel", "SlotFiller", "CatalogVocab", "ExpansionTable",
+    "UseCaseInferencer", "resolve_category", "coarse_category", "missing_required",
+    "attr_value", "REQUIRED_SLOTS", "DEFAULT_REQ",
+    # Re-exported from belief.py
+    "Belief", "BeliefModel", "converge",
+    "QuestionSelector", "RationaleBuilder",
+    "apply_negatives", "apply_category_gate",
+]

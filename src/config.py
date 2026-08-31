@@ -35,6 +35,8 @@ RRF_K: int = 60  # rank smoothing constant in 1/(k+rank)
 POOL_SIZE: int = 200          # default pool for retrieval (measured: 50→200 lifted MRR)
 POOL_BY_PHASE: dict[str, int] = {"explore": 200, "converge": 200, "deliver": 120}
 POOL_NO_PERSONALIZATION: int = 10  # minimal pool when Personalizer is disabled
+OVERRIDE_POOL_BOOST: float = 1.5   # expand pool by this factor for 2 turns after intent override
+OVERRIDE_POOL_TURNS: int = 2       # number of turns the boosted pool lasts
 
 # ---------------------------------------------------------------------------
 # Synonym expansion
@@ -272,7 +274,7 @@ REGIME_LEAKY_MIN_EXACT: int = 1   # exact phrase matches per top candidate to ca
 # correct for real sessions but regressed public boundary MTTC (4.10→6.60) because the evaluator's
 # verbatim disclosures can trigger spurious category parses. Off by default; re-enable after
 # validating on the honest intent-override/boundary sets specifically.
-USE_CATEGORY_SWITCH_CLEAR: bool = False  # OPTIONAL — gate rule (b) until MTTC regression resolved
+USE_CATEGORY_SWITCH_CLEAR: bool = True   # CORE — only fires on confirmed override turns (is_override=True)
 # Rule (c) negation purge from profile — off by default (safe but low measurable impact on evals
 # since public/private users don't share profile state). On for real user deployments.
 USE_PROFILE_NEGATION_PURGE: bool = True  # OPTIONAL — mask retired profile tags this session
@@ -312,7 +314,20 @@ REVEAL_HOLDBACK_K: int = 1           # list length while holding back (measured:
 # discriminate) and (b) adds a pool-derived `feature` facet: a distinctive token the top candidates
 # split on, asked as a feature question. Category-adaptive by construction; off by default until
 # measured on pillar_free browsing + the public MTTC guardrail.
-USE_ADAPTIVE_CLARIFY: bool = False
+USE_ADAPTIVE_CLARIFY: bool = True   # CORE — pool-derived facet questions; filters unaskable slots
+# Discovery Mode (CoShop/CoPref, arXiv 2026): when the shopper is browsing with no stated
+# preferences, present 3 product archetypes from the retrieved pool to help them construct
+# their preference rather than asking abstract slot questions. Targets cold-start MTTC.
+USE_DISCOVERY_MODE: bool = True
+DISCOVERY_MODE_MAX_TURN: int = 2    # only on early turns when category is still unclear
+DISCOVERY_MODE_MAX_SLOTS: int = 1   # max filled positive slots before switching off
+
+# Snippet rationale (Snippet-CRS, arXiv 2024): surface the specific product description sentence
+# that best matches the user's active need, making the recommendation self-explanatory.
+USE_SNIPPET_RATIONALE: bool = True
+# Contrastive explanation (C2-CRS, WSDM 2022): when returning 2+ recommendations, show slot-level
+# differential between top-2 ("A wins on material; B is $30 cheaper").
+USE_CONTRAST_RATIONALE: bool = True
 
 # ---------------------------------------------------------------------------
 # Natural-language constraint capture (docs/EXPERIMENTS.md — keystone honest-generalization fix).

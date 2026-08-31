@@ -17,6 +17,7 @@ from src.config import (
     COVERAGE_DISCRIMINATION_PCTL, COVERAGE_INFORMATIVE_MIN, COVERAGE_PREFIX_BONUS,
     COVERAGE_PREFIX_CHARS, SUPPRESS_POP_ON_PARAPHRASE,
     COVERAGE_RETRIEVAL_WEIGHT, DIVERSITY_HEAD_KEEP, DIVERSITY_LAMBDA, EXPANSION_WEIGHT,
+    BUYING_VECTOR_WEIGHT, BROWSING_VECTOR_WEIGHT,
     CE_BETA, CE_CONVEX_GATE_MARGIN, USE_CE_CONVEX, USE_NL_CONSTRAINTS,
     USE_REGIME_ROUTING, REGIME_LEAKY_MIN_EXACT,
     LLM_RERANK_DEPTH, LLM_WEIGHT, POOL_BY_PHASE, POOL_NO_PERSONALIZATION, POOL_SIZE,
@@ -27,7 +28,10 @@ from src.config import (
     SATISFACTION_SEM_ALPHA, SATISFACTION_SEM_GATE_HIGH, SATISFACTION_SEM_GATE_LOW,
     SATISFACTION_SPECIFICITY_REF, SATISFACTION_UNKNOWN_FLOOR,
     SEMANTIC_COVERAGE_GATE, SEMANTIC_COVERAGE_WEIGHT, SESSION_MAX_TURNS,
+    OVERRIDE_POOL_BOOST, OVERRIDE_POOL_TURNS,
     LTR_MODEL_PATH, SLOT_DECAY, STRUCTURED_COVERAGE_WEIGHT, USE_ADAPTIVE_CLARIFY,
+    USE_DISCOVERY_MODE, DISCOVERY_MODE_MAX_TURN, DISCOVERY_MODE_MAX_SLOTS,
+    USE_SNIPPET_RATIONALE, USE_CONTRAST_RATIONALE,
     USE_CATEGORY_GATE, USE_LTR,
     USE_SATISFACTION_RANKER,
 )
@@ -193,6 +197,11 @@ class Agent:
     USE_ACTIVE_CONVERGENCE = True
     USE_INFO_GAIN_QUESTION = True
     USE_ADAPTIVE_CLARIFY = USE_ADAPTIVE_CLARIFY   # pool-derived feature-facet questions
+    USE_DISCOVERY_MODE = USE_DISCOVERY_MODE       # archetype presentation for cold-start browsing
+    DISCOVERY_MODE_MAX_TURN = DISCOVERY_MODE_MAX_TURN
+    DISCOVERY_MODE_MAX_SLOTS = DISCOVERY_MODE_MAX_SLOTS
+    USE_SNIPPET_RATIONALE = USE_SNIPPET_RATIONALE  # best-matching description sentence
+    USE_CONTRAST_RATIONALE = USE_CONTRAST_RATIONALE  # slot-level A-vs-B differential
     INFO_GAIN_MODE = "display"  # "display" (benchmark-safe) | "ask"
     USE_LLM_SLOTS = True        # LLM slot extraction fallback for natural language constraints
     # LLM slots fire only when the regex extracted fewer than this many constraints (a "regex
@@ -256,14 +265,15 @@ class Agent:
         self._question_selector = QuestionSelector(
             self._catalog.products, self._coverage.doc, self._vocab.price_quantiles)
         self._question_selector.adaptive_clarify = self.USE_ADAPTIVE_CLARIFY
-        self._rationale = RationaleBuilder(self._catalog.products, self._coverage.doc)
-
         self._vector: VectorRetriever | None = None
         if self.USE_VECTOR:
             try:
                 self._vector = VectorRetriever()
             except Exception:
                 self._vector = None
+
+        self._rationale = RationaleBuilder(
+            self._catalog.products, self._coverage.doc, vector=self._vector)
 
         # Alternate ranker (docs/RANKING_REDESIGN.md Phase 1): satisfaction = generalized coverage
         # with a semantic term. Shares the CoverageReranker's cached text/IDF and the vector store.
@@ -382,6 +392,7 @@ class Agent:
 
         if self._router.is_override(user_message):
             state.intent = "override"
+            state.override_turn = turn
             self._tracer.note("override phrase detected → intent forced to 'override'")
 
         bm = re.search(r"preference for (\w+)", user_message.lower())
@@ -394,14 +405,12 @@ class Agent:
         new_constraints_arrived = len(state.constraint_phrases) > prev_phrase_count
 
         if self.USE_NEED_MODEL:
+            is_override_turn = (state.intent == "override")
             regex_constraints = self._slot_filler.parse(user_message, turn)
-            state.need.revise(regex_constraints)
+            state.need.revise(regex_constraints, is_override=is_override_turn)
             if self.USE_PROFILE_NEGATION_PURGE:
                 self._purge_negated_profile_tags(state)  # rule (c): mask retired profile tags
-            # LLM slot extraction as fallback: covers natural language the regex misses
-            # ("budget-friendly", "my daughter's recital", "warm without the itch").
-            # Context-aware — passes the conversation, known slots, and category so vague
-            # or relative messages resolve correctly. Runs when regex found few constraints.
+            # LLM slot extraction as fallback: covers natural language the regex misses.
             if (self._slot_extractor and self._slot_extractor.available
                     and len(regex_constraints) < self.LLM_SLOT_MAX_REGEX
                     and len(user_message.split()) >= 4):
@@ -413,7 +422,7 @@ class Agent:
                     state.need.revise([Constraint(
                         slot=raw["slot"], value=raw["value"],
                         polarity=raw["polarity"], weight=0.8, turn=turn,
-                    )])
+                    )], is_override=is_override_turn)
             if self.USE_PROFILE_NEGATION_PURGE:
                 self._purge_negated_profile_tags(state)  # re-run after LLM may add negatives
 
@@ -449,8 +458,10 @@ class Agent:
             state.plan = self._policy.plan(
                 state.ctx, state.buying_score, state.conv_state,
                 state.ig_attr, warm=bool(state.profile and state.profile.prefs))
+            if self._tracer.enabled and state.plan is not None:
+                self._tracer.stage("dcp_plan", **state.plan.as_dict())
 
-        pool = self._pool_size(state)
+        pool = self._pool_size(state, turn=turn)
         candidates = self._retrieve(state, pool)
         retrieval_order = list(candidates)   # original fused order, for the LTR retrieval_rank feature
         state.last_pool = len(candidates)
@@ -566,7 +577,7 @@ class Agent:
             if self.USE_INFO_GAIN_QUESTION:
                 state.ig_attr, state.ig_phrasing = self._question_selector.select(
                     state.belief, state.need, state.conv_state,
-                    candidates[:self._belief_model.TOPN], guidance=guidance)
+                    candidates[:self._belief_model.TOPN], guidance=guidance, turn=turn)
             state.prev_ask = state.ig_attr
             state.prev_entropy = state.belief.entropy
             state.prev_conf = state.belief.confidence
@@ -658,30 +669,7 @@ class Agent:
                 info_gain_attr=state.ig_attr,
                 info_gain_phrasing=state.ig_phrasing)
 
-        ask_attr = next_ask(state, self.USE_INFO_GAIN_QUESTION, self.INFO_GAIN_MODE)
-        template_message = compose_message(ask_attr, state, self.USE_INFO_GAIN_QUESTION)
-
-        if self.USE_REC_RATIONALE and candidates:
-            why = self._rationale.build(candidates[0], state.need)
-            if why:
-                template_message = f"Top pick {why}. {template_message}"
-
-        if self._response_gen and self._response_gen.available:
-            top_titles = [
-                str(self._catalog.products.get(a, {}).get("title") or "")[:60]
-                for a in candidates[:2]
-            ]
-            known = [c.value for c in state.need.positives() if c.slot != "category"]
-            message = self._response_gen.generate(
-                conversation=state.all_text,
-                top_titles=top_titles,
-                ask_slot=ask_attr,
-                ask_phrasing=state.ig_phrasing or template_message,
-                constraints_found=known,
-                fallback=template_message,
-            )
-        else:
-            message = template_message
+        ask_attr, message = self._build_response(state, candidates, turn)
 
         if self.USE_DCP and self.DCP_PROFILE and state.profile is not None \
                 and state.ctx is not None:
@@ -744,6 +732,70 @@ class Agent:
             "recommendations": [{"parent_asin": a} for a in recommendations],
             "usage": usage,
         }
+
+    def _build_response(
+        self, state: ConversationState, candidates: list[str], turn: int,
+    ) -> tuple[str, str]:
+        """Build the ask_attribute and message for this turn.
+
+        Separated from respond() so the pipeline reads clearly:
+            understand → retrieve → rank → _build_response() → return
+
+        Returns (ask_attr, message).
+        """
+        ask_attr = next_ask(state, self.USE_INFO_GAIN_QUESTION, self.INFO_GAIN_MODE)
+        template_message = compose_message(ask_attr, state, self.USE_INFO_GAIN_QUESTION)
+
+        # Discovery Mode: cold-start browsing with no stated preferences → present archetypes
+        if (self.USE_DISCOVERY_MODE
+                and state.intent in ("browsing", "mixed", "unknown")
+                and turn <= self.DISCOVERY_MODE_MAX_TURN
+                and len(state.need.positives()) <= self.DISCOVERY_MODE_MAX_SLOTS
+                and candidates):
+            discovery_msg = self._question_selector.discovery_message(
+                candidates[:15], state.need.category)
+            if discovery_msg:
+                template_message = discovery_msg
+                if self._tracer.enabled:
+                    self._tracer.note("discovery mode: presenting product archetypes")
+
+        if self.USE_REC_RATIONALE and candidates:
+            if self.USE_SNIPPET_RATIONALE:
+                snippet = self._rationale.build_snippet(candidates[0], state.need)
+                if snippet:
+                    template_message = f'"{snippet}" {template_message}'
+                else:
+                    why = self._rationale.build(candidates[0], state.need)
+                    if why:
+                        template_message = f"Top pick {why}. {template_message}"
+            else:
+                why = self._rationale.build(candidates[0], state.need)
+                if why:
+                    template_message = f"Top pick {why}. {template_message}"
+            if self.USE_CONTRAST_RATIONALE and len(candidates) >= 2:
+                contrast = self._rationale.build_contrast(
+                    candidates[0], candidates[1], state.need)
+                if contrast:
+                    template_message = f"{template_message} {contrast}"
+
+        if self._response_gen and self._response_gen.available:
+            top_titles = [
+                str(self._catalog.products.get(a, {}).get("title") or "")[:60]
+                for a in candidates[:2]
+            ]
+            known = [c.value for c in state.need.positives() if c.slot != "category"]
+            message = self._response_gen.generate(
+                conversation=state.all_text,
+                top_titles=top_titles,
+                ask_slot=ask_attr,
+                ask_phrasing=state.ig_phrasing or template_message,
+                constraints_found=known,
+                fallback=template_message,
+            )
+        else:
+            message = template_message
+
+        return ask_attr, message
 
     def _reveal_count(
         self, state: ConversationState, turn: int, top_k: int, new_constraints: bool
@@ -829,26 +881,104 @@ class Agent:
             })
         return picks
 
-    def _pool_size(self, state: ConversationState) -> int:
+    def _pool_size(self, state: ConversationState, turn: int = 0) -> int:
         if not self.USE_PERSONALIZATION:
             return POOL_NO_PERSONALIZATION
+        base = POOL_SIZE
         if self.USE_DCP and self.DCP_ORCHESTRATION and state.plan is not None:
-            return state.plan.pool_size
-        if self.USE_ADAPTIVE_TRUNCATION:
-            return self.POOL_BY_PHASE.get(state.phase, POOL_SIZE)
-        return POOL_SIZE
+            base = state.plan.pool_size
+        elif self.USE_ADAPTIVE_TRUNCATION:
+            base = self.POOL_BY_PHASE.get(state.phase, POOL_SIZE)
+        # Override recovery: expand pool for OVERRIDE_POOL_TURNS turns after an intent override
+        # so the new intent gets a clean, wide retrieval start instead of a stale narrow pool.
+        if (state.override_turn is not None
+                and turn - state.override_turn < OVERRIDE_POOL_TURNS):
+            base = min(int(base * OVERRIDE_POOL_BOOST), 300)
+        return base
 
     def _retrieve(self, state: ConversationState, pool: int) -> list[str]:
-        """BM25 + optional dense + optional expansion side-track, fused via RRF."""
+        """Dispatch to intent-specific retrieval track, then fuse the expansion side-track.
+
+        Buying → _retrieve_buying(): BM25-primary, keyword-precise, hard-constraint shaped.
+        Browsing → _retrieve_browsing(): dense-primary, semantic, broader cross-category recall.
+        Mixed → blended weights between the two extremes.
+        """
+        intent = state.intent
         query = state.query_text()
+
+        if self._tracer.enabled:
+            self._tracer.stage("retrieval", query=query, intent=intent)
+
+        if not query.strip():
+            return self._catalog.bm25(query, pool)
+
+        # --- intent-specific retrieval track ---
+        if intent == "buying":
+            fused = self._retrieve_buying(state, query, pool)
+        elif intent == "browsing":
+            fused = self._retrieve_browsing(state, query, pool)
+        else:
+            # mixed / override: blend between the two tracks
+            fused = self._retrieve_blended(state, query, pool)
+
+        # --- expansion side-track (shared across all intents) ---
+        fused = self._apply_expansion(state, query, fused, pool)
+        return fused
+
+    def _retrieve_buying(self, state: ConversationState, query: str, pool: int) -> list[str]:
+        """High-precision filter track: BM25-primary with tight keyword matching.
+
+        Buying shoppers have hard constraints; BM25 on exact terms outperforms dense here.
+        Dense is a secondary diversity/recall layer at a low weight (BUYING_VECTOR_WEIGHT=0.20).
+        """
         bm25_results = self._catalog.bm25(query, pool)
         if self._tracer.enabled:
-            self._tracer.stage("retrieval", query=query, bm25_top=bm25_results[:8])
-
-        if not (self.USE_VECTOR and self._vector) or not query.strip():
-            self._tracer.stage("retrieval", strategy="bm25_only", dense_weight=0.0)
+            self._tracer.stage("retrieval", strategy="buying_bm25_primary",
+                               bm25_top=bm25_results[:5])
+        if not (self.USE_VECTOR and self._vector):
             return bm25_results
+        try:
+            dense_results = self._vector.search(query, pool)
+        except Exception:
+            return bm25_results
+        w = BUYING_VECTOR_WEIGHT
+        fused = rrf(bm25_results, dense_results, w, top_n=pool)
+        if self._tracer.enabled:
+            self._tracer.note(f"buying track: BM25-primary + dense secondary (w={w:.2f})")
+        return fused
 
+    def _retrieve_browsing(self, state: ConversationState, query: str, pool: int) -> list[str]:
+        """Diverse dense retrieval track: dense-primary for open-ended cross-category discovery.
+
+        Browsing shoppers are exploring; dense semantic search surfaces unexpected matches.
+        BM25 is a secondary grounding layer at a lower weight.
+        Slot-decayed multi-turn dense encoding lets recent turns dominate when interest shifts.
+        """
+        if not (self.USE_VECTOR and self._vector):
+            return self._catalog.bm25(query, pool)
+        try:
+            if SLOT_DECAY < 1.0:
+                dense_results = self._vector.search_decayed(state.all_text, pool, SLOT_DECAY)
+            else:
+                dense_results = self._vector.search(query, pool)
+        except Exception:
+            return self._catalog.bm25(query, pool)
+        bm25_results = self._catalog.bm25(query, pool)
+        w = BROWSING_VECTOR_WEIGHT
+        # Dense is primary (weight 1.0), BM25 is secondary (lower weight relative to dense)
+        fused = rrf(dense_results, bm25_results, 1.0 / w if w > 0 else 1.0, top_n=pool)
+        if self._tracer.enabled:
+            self._tracer.note(f"browsing track: dense-primary + BM25 secondary (dense w={w:.2f})")
+        return fused
+
+    def _retrieve_blended(self, state: ConversationState, query: str, pool: int) -> list[str]:
+        """Mixed-intent track: continuous weight interpolation by buying_score."""
+        bm25_results = self._catalog.bm25(query, pool)
+        if self._tracer.enabled:
+            self._tracer.stage("retrieval", strategy="mixed_blended",
+                               bm25_top=bm25_results[:5])
+        if not (self.USE_VECTOR and self._vector):
+            return bm25_results
         if self.USE_DCP and self.DCP_ORCHESTRATION and state.plan is not None:
             w = state.plan.route_weights.get("dense",
                 vector_weight(state.buying_score, self.USE_INTENT_ROUTING,
@@ -856,45 +986,39 @@ class Agent:
         else:
             w = vector_weight(state.buying_score, self.USE_INTENT_ROUTING,
                               self.USE_CONFIDENCE_ROUTING)
-
         try:
             if SLOT_DECAY < 1.0:
                 dense_results = self._vector.search_decayed(state.all_text, pool, SLOT_DECAY)
             else:
                 dense_results = self._vector.search(query, pool)
         except Exception:
-            self._tracer.stage("retrieval", strategy="bm25_fallback", dense_weight=0.0)
             return bm25_results
-
         fused = rrf(bm25_results, dense_results, w, top_n=pool)
         if self._tracer.enabled:
-            self._tracer.stage(
-                "retrieval", strategy="hybrid_rrf", dense_weight=round(w, 4),
-                dense_top=dense_results[:8])
-            self._tracer.note(
-                f"hybrid retrieval: BM25 + dense (RRF, dense weight {w:.2f})")
+            self._tracer.note(f"mixed track: hybrid RRF (dense w={w:.2f})")
+        return fused
 
-        if self.USE_NEED_MODEL:
-            expansion_terms: set[str] = set()
-            if self.USE_SLOT_EXPANSION:
-                expansion_terms |= self._expansion.expand(state.need)
-                expansion_terms |= {c.value for c in state.need.positives()}
-                # expand_text catches words the slot filler doesn't extract as named
-                # slots (e.g. "merino", "vegan") so the data-driven table fires on them
-                expansion_terms |= self._expansion.expand_text(query)
-            if self.USE_USECASE_PRIORS:
-                expansion_terms |= self._usecase.infer(state.need)["terms"]
-            expansion_terms = {t for t in expansion_terms if t}
-            if expansion_terms:
-                exp_results = self._catalog.bm25(" ".join(sorted(expansion_terms)), pool)
-                if exp_results:
-                    fused = rrf(fused, exp_results, self.EXPANSION_WEIGHT, top_n=pool)
-                    if self._tracer.enabled:
-                        self._tracer.stage(
-                            "retrieval",
-                            expansion_terms=sorted(expansion_terms)[:12],
-                            expansion_weight=self.EXPANSION_WEIGHT)
-
+    def _apply_expansion(self, state: ConversationState, query: str,
+                         fused: list[str], pool: int) -> list[str]:
+        """Synonym expansion + use-case prior side-track, fused into any retrieval result."""
+        if not self.USE_NEED_MODEL:
+            return fused
+        expansion_terms: set[str] = set()
+        if self.USE_SLOT_EXPANSION:
+            expansion_terms |= self._expansion.expand(state.need)
+            expansion_terms |= {c.value for c in state.need.positives()}
+            expansion_terms |= self._expansion.expand_text(query)
+        if self.USE_USECASE_PRIORS:
+            expansion_terms |= self._usecase.infer(state.need)["terms"]
+        expansion_terms = {t for t in expansion_terms if t}
+        if expansion_terms:
+            exp_results = self._catalog.bm25(" ".join(sorted(expansion_terms)), pool)
+            if exp_results:
+                fused = rrf(fused, exp_results, self.EXPANSION_WEIGHT, top_n=pool)
+                if self._tracer.enabled:
+                    self._tracer.stage("retrieval",
+                                       expansion_terms=sorted(expansion_terms)[:12],
+                                       expansion_weight=self.EXPANSION_WEIGHT)
         return fused
 
     @property

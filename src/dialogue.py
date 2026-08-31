@@ -98,6 +98,7 @@ class ConversationState:
     phase: str = "explore"
     last_pool: int = 0
     constraint_phrases: list = field(default_factory=list)
+    override_turn: int | None = None  # turn number of last intent override (for pool boost)
 
     need: NeedModel = field(default_factory=NeedModel)
     belief: Belief = field(default_factory=Belief)

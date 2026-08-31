@@ -263,24 +263,28 @@ class NeedModelReviseTest(unittest.TestCase):
         self.assertIn("polyester", [c.value for c in n.positives("material")])
         self.assertNotIn("linen", [c.value for c in n.positives("material")])
 
-    # Rule (b): category-switch retires stale prior-turn modifiers (only when flag is on)
-    def test_category_switch_clears_prior_modifiers(self):
-        import src.config as _cfg
-        if not _cfg.USE_CATEGORY_SWITCH_CLEAR:
-            self.skipTest("USE_CATEGORY_SWITCH_CLEAR is off — rule (b) not active")
+    # Rule (b): category-switch retires stale prior-turn modifiers — only on override turns
+    def test_category_switch_clears_prior_modifiers_on_override(self):
         from src.understanding import NeedModel
         n = NeedModel()
         n.revise([self._c("category", "boot", turn=1)])
         n.revise([self._c("color", "brown", turn=1)])
-        n.revise([self._c("category", "sandal", turn=3)])
+        n.revise([self._c("category", "sandal", turn=3)], is_override=True)
         colors = [c.value for c in n.positives("color")]
-        self.assertEqual(colors, [], f"stale color 'brown' should be cleared on category switch, got {colors}")
+        self.assertEqual(colors, [], f"stale 'brown' should clear on override category switch, got {colors}")
         self.assertEqual(n.category, "sandal")
 
+    def test_category_switch_does_not_clear_on_normal_turn(self):
+        # Rule (b) must NOT fire on a normal turn — only on is_override=True
+        from src.understanding import NeedModel
+        n = NeedModel()
+        n.revise([self._c("category", "boot", turn=1)])
+        n.revise([self._c("color", "brown", turn=1)])
+        n.revise([self._c("category", "sandal", turn=3)], is_override=False)
+        colors = [c.value for c in n.positives("color")]
+        self.assertIn("brown", colors, "non-override category change must NOT clear prior color")
+
     def test_category_switch_preserves_current_turn_modifiers(self):
-        import src.config as _cfg
-        if not _cfg.USE_CATEGORY_SWITCH_CLEAR:
-            self.skipTest("USE_CATEGORY_SWITCH_CLEAR is off — rule (b) not active")
         from src.understanding import NeedModel
         n = NeedModel()
         n.revise([self._c("category", "boot", turn=1)])
@@ -288,7 +292,7 @@ class NeedModelReviseTest(unittest.TestCase):
         n.revise([
             self._c("category", "sandal", turn=3),
             self._c("color", "black", turn=3),
-        ])
+        ], is_override=True)
         colors = [c.value for c in n.positives("color")]
         self.assertIn("black", colors)
         self.assertNotIn("brown", colors)
