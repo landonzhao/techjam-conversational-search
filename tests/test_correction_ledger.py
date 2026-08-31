@@ -310,17 +310,18 @@ def test_phrase_history_is_retired_on_repair():
     assert state.constraint_phrase_turns == [2]
 
 
-def test_top_ten_requests_bypass_adaptive_reveal():
+def test_top_ten_requests_preserve_adaptive_reveal():
     from src.agent import Agent
 
     agent = object.__new__(Agent)
     agent.USE_ADAPTIVE_REVEAL = True
     agent.REVEAL_CONFIDENCE = 0.99
+    agent.REVEAL_HOLDBACK_K = 1
     agent.REVEAL_TURN_CAP = 10
-    agent.REVEAL_REQUIRE_CONSTRAINTS = True
+    agent.REVEAL_REQUIRE_CONSTRAINTS = False
     class State:
         belief = type("Belief", (), {"confidence": 0.0})()
-    assert agent._reveal_count(State(), turn=1, top_k=10, new_constraints=False) == 10
+    assert agent._reveal_count(State(), turn=1, top_k=10, new_constraints=False) == 1
 
 
 def test_llm_slot_parser_uses_the_same_update_contract():

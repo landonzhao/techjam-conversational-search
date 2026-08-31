@@ -12,7 +12,8 @@ from src.catalog import STOPWORDS, TOKEN_RE, text, terms
 from src.config import (
     COVERAGE_FULL_PHRASE_BONUS, COVERAGE_LEN_WEIGHT, COVERAGE_POP_BLEND,
     COVERAGE_TIE_BREAK, POP_WEIGHT, PRICE_FAR_PENALTY, PRICE_LOOSE, PRICE_NEAR,
-    RRF_K, TAG_WEIGHT,
+    RRF_K, SATISFACTION_POP_CHANNEL, SATISFACTION_QUALITY_CHANNEL,
+    SATISFACTION_SEM_GATE_HIGH, SATISFACTION_SEM_GATE_LOW, SATISFACTION_UNKNOWN_FLOOR, TAG_WEIGHT,
 )
 
 
@@ -527,21 +528,25 @@ class NeedSatisfactionScorer:
     def __init__(self, coverage: "CoverageReranker", vector=None,
                  sem_alpha: float = 1.0, pop_weight: float = 0.0,
                  specificity_ref: int = 3,
-                 pop_channel: float = 0.7,
-                 quality_channel: float = 0.3,
-                 sem_gate_low: float = 0.25,
-                 sem_gate_high: float = 0.65,
-                 unknown_floor: float = 0.5) -> None:
+                 pop_channel: float = SATISFACTION_POP_CHANNEL,
+                 quality_channel: float = SATISFACTION_QUALITY_CHANNEL,
+                 sem_gate_low: float = SATISFACTION_SEM_GATE_LOW,
+                 sem_gate_high: float = SATISFACTION_SEM_GATE_HIGH,
+                 unknown_floor: float = SATISFACTION_UNKNOWN_FLOOR) -> None:
         self._cov = coverage
         self._vector = vector
         self.sem_alpha = sem_alpha
         self.pop_weight = pop_weight
         self.specificity_ref = max(1, specificity_ref)
+        # Multi-channel prior weights (normalised to sum 1 so prior stays on [0,1]).
         total = (pop_channel + quality_channel) or 1.0
         self.pop_channel = pop_channel / total
         self.quality_channel = quality_channel / total
+        # Per-candidate semantic gate thresholds. Clamped so LOW < HIGH.
         self.sem_gate_low = max(0.0, min(sem_gate_low, sem_gate_high - 1e-6))
         self.sem_gate_high = max(self.sem_gate_low + 1e-6, sem_gate_high)
+        # Neutral floor for catalog-silent candidates (zero lexical AND zero semantic evidence).
+        # Silence ≠ conflict; prevent unfair demotion of sparse listings vs. boilerplate matches.
         self.unknown_floor = max(0.0, unknown_floor)
 
     def _lexical(self, toks: list[str], catalog_text: str) -> float:
@@ -552,26 +557,31 @@ class NeedSatisfactionScorer:
         present = sum(self._cov._idf(t) for t in toks if t in catalog_text)
         return present / total
 
-    def score_map(self, asins: list[str], phrases: list[str]) -> tuple[dict[str, float], dict[str, float]]:
-        """Compute normalized satisfaction scores without sorting candidates.
+    def score_map(self, asins: list[str], phrases: list[str]) -> dict[str, float]:
+        """Expose raw satisfaction scores for optional fusion rankers without enabling them."""
+        return self.rank(asins, phrases, pop_weight=0.0)[1]
 
-        Positive evidence is graded lexical/semantic agreement.  A missing field is UNKNOWN, not
-        a conflict: it supplies no negative contribution and leaves the retrieval term to carry a
-        sparse listing.  Explicit negative constraints are handled by the existing NeedModel path.
-        """
+    def rank(self, asins: list[str], phrases: list[str],
+             pop_weight: float | None = None) -> tuple[list[str], dict[str, float]]:
+        """Return (ordered_asins, satisfaction_score_per_asin). Order preserves the incoming
+        (retrieval) order on ties, so a strong retrieval placement is the natural floor.
+
+        pop_weight overrides the instance popularity weight for this call (e.g. 0.0 on
+        natural-language turns, where the phrases are generic regex slot values and letting
+        popularity break ties would bury a well-retrieved but unpopular target)."""
+        eff_pop_weight = self.pop_weight if pop_weight is None else pop_weight
         prepared = self._cov._prepare(phrases)
-        zero = {asin: 0.0 for asin in asins}
         if not prepared or len(asins) <= 1:
-            return zero, zero
+            return asins, {a: 0.0 for a in asins}
+        # per-phrase semantic cosine to every candidate (one encode + cached-embedding dot products)
         sims: dict[str, list[float]] = {}
         if self._vector is not None and self.sem_alpha > 0:
-            sims = self._vector.phrase_similarity_matrix(
-                [whole for _, whole in prepared], asins)
+            sims = self._vector.phrase_similarity_matrix([whole for _, whole in prepared], asins)
         sat: dict[str, float] = {}
-        sem_conf: dict[str, float] = {}
-        for asin in asins:
-            catalog_text = self._cov.doc(asin)
-            row = sims.get(asin)
+        sem_conf: dict[str, float] = {}  # per-candidate max phrase cosine — semantic confidence
+        for a in asins:
+            catalog_text = self._cov.doc(a)
+            row = sims.get(a)
             num = den = 0.0
             top_sem = 0.0
             for j, (toks, _whole) in enumerate(prepared):
@@ -580,39 +590,39 @@ class NeedSatisfactionScorer:
                 if sem > top_sem:
                     top_sem = sem
                 match = max(lex, self.sem_alpha * sem)
-                weight = 1.0 + COVERAGE_LEN_WEIGHT * len(toks)
+                weight = 1.0 + COVERAGE_LEN_WEIGHT * len(toks)  # longer phrase = more specific
                 num += weight * match
                 den += weight
             raw = num / den if den > 0 else 0.0
-            sem_conf[asin] = top_sem
-            # Neutral floor: catalog-silent candidates get unknown_floor instead of 0
-            sat[asin] = (self.unknown_floor
-                         if raw <= 0.0 and top_sem <= 0.0 and self.unknown_floor > 0
-                         else raw)
-        return sat, sem_conf
-
-    def rank(self, asins: list[str],
-             phrases: list[str],
-             pop_weight: float | None = None) -> tuple[list[str], dict[str, float]]:
-        """Return (ordered_asins, satisfaction_score_per_asin).
-
-        pop_weight overrides the instance weight for this call (0.0 on NL turns).
-        """
-        eff_pop_weight = self.pop_weight if pop_weight is None else pop_weight
-        prepared = self._cov._prepare(phrases)
-        if not prepared or len(asins) <= 1:
-            return asins, {a: 0.0 for a in asins}
-        sat, sem_conf = self.score_map(asins, phrases)
+            sem_conf[a] = top_sem
+            # Neutral floor: catalog-silent candidate (no lexical AND no semantic evidence) gets
+            # unknown_floor instead of 0 so sparse listings aren't unfairly demoted vs boilerplate.
+            sat[a] = (self.unknown_floor
+                      if raw <= 0.0 and top_sem <= 0.0 and self.unknown_floor > 0
+                      else raw)
         base_rank = {a: i for i, a in enumerate(asins)}
+        # Adaptive multi-channel prior (teammate branch-ranking, Walmart Unified Supervision
+        # Framework flavour): the prior supervises the ranking only where BOTH the shopper is still
+        # vague AND the encoder is unsure about this specific candidate. See `_adaptive_prior`.
+        # eff_pop_weight is 0 on natural-language turns (my NL capture), silencing the prior so the
+        # generic regex phrases fall back to the retrieval order instead of fame.
         ranked = sat
         if eff_pop_weight > 0:
             priors = self._adaptive_prior(asins, sem_conf, len(prepared), pop_weight=eff_pop_weight)
             if priors:
                 ranked = {a: sat[a] + priors[a] for a in asins}
         order = sorted(asins, key=lambda a: (-ranked[a], base_rank[a]))
-        return order, sat
+        return order, sat  # return raw satisfaction as the score (belief sees true satisfaction)
 
+    # ---------------------------------------------------------------------- prior
     def _sem_gate(self, sem_conf: float) -> float:
+        """Per-candidate popularity gate driven by the encoder's confidence in that candidate.
+
+        Returns 1.0 when the semantic channel is unreliable (`sem_conf ≤ LOW`), 0.0 when it is
+        strong (`sem_conf ≥ HIGH`), and a linear interpolation in between. This is what lets a
+        long-tail correct match survive: once the encoder is confident about it, the popularity
+        prior stops competing for its ranking slot.
+        """
         lo, hi = self.sem_gate_low, self.sem_gate_high
         if sem_conf >= hi:
             return 0.0
@@ -621,14 +631,34 @@ class NeedSatisfactionScorer:
         return 1.0 - (sem_conf - lo) / (hi - lo)
 
     def _quality(self, asin: str) -> float:
+        """Average-rating channel, mapped to [0,1] so only ≥3-star products contribute."""
         try:
             r = float(self._cov.catalog.get(asin, {}).get("average_rating") or 0.0)
         except (TypeError, ValueError):
             r = 0.0
         return max(0.0, min(1.0, (r - 3.0) / 2.0))
 
-    def _adaptive_prior(self, asins: list[str], sem_conf: dict[str, float],
-                        n_phrases: int, pop_weight: float | None = None) -> dict[str, float]:
+    def _adaptive_prior(
+        self, asins: list[str], sem_conf: dict[str, float], n_phrases: int,
+        pop_weight: float | None = None,
+    ) -> dict[str, float]:
+        """Multi-channel engagement prior, per-candidate gated by semantic confidence.
+
+            popularity(a) = log1p(rating_number(a)) / max_pool(log1p(rating_number))
+            quality(a)    = clip((average_rating(a) − 3) / 2, 0, 1)
+            prior(a)      = POP_CHANNEL · popularity(a)  +  QUALITY_CHANNEL · quality(a)
+            specificity   = min(1, n_phrases / specificity_ref)          # user-level decay
+            w_pop(a)      = pop_weight · (1 − specificity) · sem_gate(sem_conf(a))
+            contribution  = w_pop(a) · prior(a)
+
+        Both `sat` and `prior` are on [0,1] so the blend is well-scaled. Rationale (Walmart USF): a
+        supervising prior only helps where the primary (semantic) channel is uncertain; where the
+        encoder is already confident, the prior is silenced so it cannot bury a long-tail correct
+        match under a more popular near-neighbour. The quality channel dampens
+        uniformly-popular-but-mediocre items even when popularity alone would boost them.
+
+        `pop_weight` overrides the instance weight (0.0 on natural-language turns).
+        """
         if not asins:
             return {}
         eff_pop_weight = self.pop_weight if pop_weight is None else pop_weight
@@ -789,9 +819,10 @@ class DualTrackRanker:
             return asins, {"coverage_gate": False}
 
         exact = self.coverage.exact_scores(asins, phrases)
-        sat, _sem_conf = self.satisfaction.score_map(asins, phrases)
-        # NeedSatisfactionScorer already applies unknown_floor; DualTrackRanker adds its own
-        # UNKNOWN guard below for the dual-track context.
+        sat = self.satisfaction.score_map(asins, phrases)
+        # No lexical/semantic evidence means the catalog is silent, not that the candidate
+        # conflicts with the request. Give that UNKNOWN state a neutral floor; only explicit
+        # positive evidence should move a sparse listing down relative to retrieval.
         sat = {
             asin: (0.5 if sat.get(asin, 0.0) <= 0.0 and exact.get(asin, 0.0) <= 0.0
                    else sat.get(asin, 0.0))
@@ -890,13 +921,11 @@ class DualTrackRanker:
 
 
 def guard_retrieval_head(
-    retrieval_order: list[str],
-    ranked_order: list[str],
-    guard_k: int,
-    visible_k: int,
+    retrieval_order: list[str], ranked_order: list[str], guard_k: int, visible_k: int,
 ) -> tuple[list[str], list[str]]:
-    """Module-level wrapper around DualTrackRanker._guard_retrieval_head for direct import."""
-    return DualTrackRanker._guard_retrieval_head(retrieval_order, ranked_order, guard_k, visible_k)
+    """Compatibility wrapper for the retained retrieval-head guard mechanism."""
+    return DualTrackRanker._guard_retrieval_head(
+        retrieval_order, ranked_order, guard_k, visible_k)
 
 
 class Diversifier:

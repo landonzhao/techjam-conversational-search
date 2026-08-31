@@ -935,13 +935,13 @@ class QuestionSelectorFormattingTest(unittest.TestCase):
         self.assertIn("($30)", phrase)
         self.assertNotIn("not available", phrase)
 
-    def test_info_gain_slot_reaches_payload_in_display_mode(self):
+    def test_display_mode_keeps_benchmark_safe_other_payload(self):
         from src.dialogue import ConversationState, next_ask
 
         state = ConversationState(user_profile={})
         state.ig_attr = "color"
         state.conv_state = "PROBE"
-        self.assertEqual(next_ask(state, True, "display"), "color")
+        self.assertEqual(next_ask(state, True, "display"), "other")
 
     def test_no_preference_slot_is_not_asked_again(self):
         from src.dialogue import ConversationState, next_ask
@@ -953,12 +953,12 @@ class QuestionSelectorFormattingTest(unittest.TestCase):
         state.boundary_attrs.add("color")
         self.assertNotEqual(next_ask(state, True, "display"), "color")
 
-    def test_fallback_prefers_supported_slot_over_other(self):
+    def test_fallback_preserves_measured_other_first_order(self):
         from src.dialogue import ConversationState, next_ask
 
         state = ConversationState(user_profile={})
         state.conv_state = "PROBE"
-        self.assertEqual(next_ask(state, True, "ask"), "feature")
+        self.assertEqual(next_ask(state, True, "ask"), "other")
 
     def test_delivery_does_not_emit_a_follow_up_action(self):
         from src.dialogue import ConversationState, compose_message, next_ask

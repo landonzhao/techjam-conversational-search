@@ -50,9 +50,13 @@ from src.ranking import (CoverageReranker, Diversifier, NeedSatisfactionScorer, 
 from src.retrieval import VectorRetriever, convex_fuse, rrf, vector_weight
 from src.trace import Tracer, get_tracer
 from src.understanding import (
-    Belief, BeliefModel, CatalogVocab, ExpansionTable, NeedModel,
-    QuestionSelector, RationaleBuilder, SlotFiller, UseCaseInferencer,
-    apply_category_gate, apply_negatives, converge, missing_required,
+    CatalogVocab, ExpansionTable, NeedModel, CATEGORY_CANON, MATERIAL_RE,
+    USE_CASE_KEYS,
+    SlotFiller, UseCaseInferencer, missing_required,
+)
+from src.belief import (
+    Belief, BeliefModel, QuestionSelector, RationaleBuilder,
+    apply_category_gate, apply_negatives, converge,
 )
 from src.keys import GeminiClientPool
 from src.llm_inference import LLMResponseGenerator, LLMSlotExtractor, SmartUseCaseInferencer
@@ -254,12 +258,18 @@ class Agent:
     DCP_PROFILE = True
     DCP_ORCHESTRATION = True
     DCP_GUIDANCE_LEARNING = True
+    DCP_PERSISTENCE = True
     # Benchmark pool-size override: when set to an int, _pool_size() returns this value regardless
     # of personalization/DCP settings. Lets ablation scripts disable profile signals without
     # shrinking recall. None = normal behaviour.
     POOL_SIZE_OVERRIDE: "int | None" = None
 
-    def __init__(self, catalog_path: str | Path = "data/catalog.jsonl") -> None:
+    def __init__(
+        self,
+        catalog_path: str | Path = "data/catalog.jsonl",
+        dcp_state_dir: str | Path | None = None,
+        persist_dcp: bool | None = None,
+    ) -> None:
         try:
             from dotenv import load_dotenv
             load_dotenv()
@@ -334,9 +344,14 @@ class Agent:
                 pass
 
         self._distiller = ContextDistiller()
-        self._profiles = ProfileService()
+        if persist_dcp is None:
+            persist_dcp = self.DCP_PERSISTENCE
+        state_dir = Path(dcp_state_dir) if dcp_state_dir is not None else None
+        profile_path = str(state_dir / "profiles.json") if state_dir is not None else None
+        guidance_path = str(state_dir / "guidance_global.json") if state_dir is not None else None
+        self._profiles = ProfileService(path=profile_path, persistent=persist_dcp)
         self._policy = OrchestrationPolicy()
-        self._guidance = GuidanceLearner()
+        self._guidance = GuidanceLearner(path=guidance_path, persistent=persist_dcp)
 
         self._slot_extractor = LLMSlotExtractor() if self.USE_LLM_SLOTS else None
         self._response_gen = LLMResponseGenerator() if self.USE_LLM_RESPONSE else None
@@ -438,7 +453,7 @@ class Agent:
         if bm:
             state.boundary_attrs.add(bm.group(1))
 
-        state.accumulate(user_message)
+        state.accumulate(user_message, turn)
         prev_phrase_count = len(state.constraint_phrases)
         state.constraint_phrases.extend(extract_constraints(user_message))
         new_constraints_arrived = len(state.constraint_phrases) > prev_phrase_count
@@ -446,7 +461,7 @@ class Agent:
         if self.USE_NEED_MODEL:
             is_override_turn = (state.intent == "override")
             regex_constraints = self._slot_filler.parse(user_message, turn)
-            state.need.revise(regex_constraints, is_override=is_override_turn)
+            state.need.revise(regex_constraints)
             if self.USE_PROFILE_NEGATION_PURGE:
                 self._purge_negated_profile_tags(state)  # rule (c): mask retired profile tags
             # LLM slot extraction as fallback: covers natural language the regex misses.
@@ -461,7 +476,7 @@ class Agent:
                     state.need.revise([Constraint(
                         slot=raw["slot"], value=raw["value"],
                         polarity=raw["polarity"], weight=0.8, turn=turn,
-                    )], is_override=is_override_turn)
+                    )])
             if self.USE_PROFILE_NEGATION_PURGE:
                 self._purge_negated_profile_tags(state)  # re-run after LLM may add negatives
 
@@ -518,7 +533,7 @@ class Agent:
         if self.USE_PERSONALIZATION and not self.USE_SATISFACTION_RANKER:
             strength = 0.5 if state.intent == "browsing" else 0.25
             candidates = self._personalizer.rerank(
-                candidates, state.user_profile, strength)
+                candidates, self._personalization_profile(state), strength)
 
         # Coverage reranker must run last — it resolves verbatim constraint phrases.
         # Semantic coverage adds a cosine-similarity bonus so paraphrased constraints
@@ -1019,6 +1034,93 @@ class Agent:
             seen.add(value)
             out.append(value)
         return out
+
+    @staticmethod
+    def _strong_leaky_phrases(phrases: list[str]) -> bool:
+        """Recognize catalog-native metadata without changing the active ranking path."""
+        joined = " ".join(phrases)
+        specific_material = any(
+            match.group(1).casefold() != "fabric"
+            for match in MATERIAL_RE.finditer(joined)
+        )
+        return specific_material or bool(re.search(
+            r"\b(?:imported|closure|rubber\s+sole|shaft\s+measures|"
+            r"solid\s+colors?|heather|machine\s+wash)\b",
+            joined,
+            re.I,
+        ))
+
+    @staticmethod
+    def _strong_turn1_leak(message: str) -> bool:
+        """Return whether a turn-one disclosure contains high-confidence catalog metadata."""
+        marker = re.search(
+            r"\b(?:key\s+requirement\s+is|what\s+matters\s+is|what\s+i\s+need\s+is)\s*:",
+            message,
+            re.I,
+        )
+        if marker:
+            scan_text = message[marker.end():]
+        else:
+            sentence = re.search(r"\.\s+", message)
+            scan_text = message[sentence.end():] if sentence else message
+        return bool(MATERIAL_RE.search(scan_text)) or bool(re.search(
+            r"\b(?:material|fabric|feature|details?)\s*[:=-]|"
+            r"\b(?:imported|closure|band|rubber\s+sole|shaft\s+measures|"
+            r"\d{2,3}%\s+\w+)\b",
+            scan_text,
+            re.I,
+        ))
+
+    @staticmethod
+    def _personalization_profile(state: ConversationState) -> dict:
+        """Mask durable preferences contradicted or superseded by the live correction ledger."""
+        profile = dict(state.user_profile)
+        tags = list(profile.get("preference_tags") or [])
+        touched = {event.slot for event in state.need.ledger if event.slot != "__last__"}
+        active: dict[str, set[str]] = {}
+        for event in state.need.constraints:
+            if event.active and event.polarity > 0 and event.value:
+                active.setdefault(event.slot, set()).add(event.value.casefold())
+        active_keys = {
+            (event.slot, event.value.casefold().strip())
+            for event in state.need.constraints
+            if event.active and event.polarity > 0 and event.value
+        }
+        rejected_keys = {
+            (event.slot, event.value.casefold().strip())
+            for event in state.need.ledger
+            if event.value and (not event.active or event.polarity <= 0)
+            and (event.slot, event.value.casefold().strip()) not in active_keys
+        }
+        rejected_values = {value for _slot, value in rejected_keys}
+        if state.profile is not None:
+            for pref in state.profile.prefs:
+                value = pref.value.casefold().strip()
+                if value in rejected_values or (pref.slot, value) in rejected_keys:
+                    tags = [tag for tag in tags if tag.casefold().strip() != value]
+                    continue
+                if pref.slot in touched and pref.slot not in active:
+                    tags = [tag for tag in tags if tag.casefold().strip() != value]
+                elif pref.slot in touched and pref.slot in active:
+                    tags = [tag for tag in tags if (
+                        tag.casefold().strip() != value or value in active[pref.slot]
+                    )]
+        excluded = {term.casefold() for term in state.need.excluded_terms()}
+        for slot, active_values in active.items():
+            if slot == "category":
+                tags = [tag for tag in tags if (
+                    CATEGORY_CANON.get(tag.casefold().strip(), tag.casefold().strip())
+                    in active_values or tag.casefold().strip() not in CATEGORY_CANON
+                )]
+            elif slot == "use_case":
+                tags = [tag for tag in tags if (
+                    tag.casefold().strip() not in USE_CASE_KEYS
+                    or tag.casefold().strip() in active_values
+                )]
+        profile["preference_tags"] = [
+            tag for tag in tags if tag.casefold().strip() not in excluded
+        ]
+        return profile
 
     def _build_ce_query(self, state: "ConversationState") -> str:
         """Build a compact natural-language query for the cross-encoder.

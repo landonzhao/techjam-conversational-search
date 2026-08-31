@@ -215,6 +215,32 @@ class ProfileService:
         """Merge the distilled session's positive constraints into durable prefs (EMA +
         recency), update category affinity, then persist (best-effort)."""
         now = time.time()
+        # A slot touched by the live ledger is authoritative. Retire superseded durable values
+        # before merging the active view so corrected preferences cannot reappear next session.
+        touched = {event.slot for event in ctx.need.ledger if event.slot != "__last__"}
+        active_by_slot: dict[str, set[str]] = {}
+        for constraint in ctx.need.positives():
+            active_by_slot.setdefault(constraint.slot, set()).add(constraint.value.casefold())
+        active_keys = {
+            (event.slot, event.value.casefold().strip())
+            for event in ctx.need.constraints
+            if event.active and event.polarity > 0 and event.value
+        }
+        rejected_values = {
+            event.value.casefold().strip()
+            for event in ctx.need.ledger
+            if event.value and (not event.active or event.polarity <= 0)
+            and (event.slot, event.value.casefold().strip()) not in active_keys
+        }
+        up.prefs = [
+            pref for pref in up.prefs
+            if pref.value.casefold().strip() not in rejected_values
+            if pref.slot not in touched
+            or (pref.slot in active_by_slot
+                and pref.value.casefold() in active_by_slot[pref.slot])
+            or (pref.slot not in active_by_slot
+                and pref.slot not in ctx.need.no_preference)
+        ]
         index = {(p.slot, p.value): p for p in up.prefs}
         for c in ctx.need.positives():
             if c.slot == "category":

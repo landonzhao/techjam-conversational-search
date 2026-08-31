@@ -274,7 +274,7 @@ REGIME_LEAKY_MIN_EXACT: int = 1   # exact phrase matches per top candidate to ca
 # correct for real sessions but regressed public boundary MTTC (4.10→6.60) because the evaluator's
 # verbatim disclosures can trigger spurious category parses. Off by default; re-enable after
 # validating on the honest intent-override/boundary sets specifically.
-USE_CATEGORY_SWITCH_CLEAR: bool = True   # CORE — only fires on confirmed override turns (is_override=True)
+USE_CATEGORY_SWITCH_CLEAR: bool = False  # OPTIONAL — parser over-fire regressed boundary MTTC
 # Rule (c) negation purge from profile — off by default (safe but low measurable impact on evals
 # since public/private users don't share profile state). On for real user deployments.
 USE_PROFILE_NEGATION_PURGE: bool = True  # OPTIONAL — mask retired profile tags this session
