@@ -23,6 +23,8 @@ any mobile app or e-commerce backend without cloud infrastructure.
 - Need-satisfaction ranking, retrieval safeguards, confidence estimation, adaptive clarification,
   and adaptive result reveal.
 - Optional local cross-encoder, Gemini-assisted language handling, and experimental linear LTR.
+- `GuidanceLearner` that measures realized information gain per clarification question and
+  reweights future question priorities online — dormant in offline evaluation, active in production.
 - Deterministic public evaluator, paraphrase robustness harness, unit/integration tests, tracing,
   an interactive CLI, and a local trace-inspection UI.
 

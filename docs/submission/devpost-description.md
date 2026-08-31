@@ -157,7 +157,7 @@ Keyword search fails the majority of real shopping sessions: shoppers often desc
 vibes, or outcomes rather than product attributes, and they change direction mid-conversation.
 TokenMaxx Copilot targets this gap directly.
 
-Four concrete impact arguments:
+Five concrete impact arguments:
 
 **Conversion friction.** Every unnecessary dialogue turn is a dropout risk. At MTTC 2.9 turns on a
 10-turn budget, the agent resolves the correct product in under three exchanges on average — with
@@ -177,6 +177,18 @@ The correction-aware state ledger also addresses a common chatbot failure: accum
 context. When a shopper changes their mind, the system retires the old constraint rather than
 carrying it forward, producing recommendations that reflect the *current* preference, not a blended
 history.
+
+**A system that learns which questions are worth asking.** Most conversational search systems ask
+clarification questions in a fixed priority order. TokenMaxx Copilot includes a `GuidanceLearner`
+that measures the realized information gain from each question asked — how much did asking "what
+material?" actually reduce uncertainty about the target? — and reweights future question priorities
+via an online exponential moving average. Per-user question priorities are blended with the global
+signal, so the system adapts both at the catalog level and per-shopper over time. In offline
+evaluation this layer is dormant because each session resets independently. In a live deployment, a
+store running for a month will have learned which attributes are genuinely discriminating for its
+catalog and which questions shoppers consistently wave off — and it will ask better questions as a
+result. This is the self-evolution pillar the problem statement describes, and it is implemented,
+not aspirational.
 
 **Vendor fairness through result diversity.** A purely relevance-ranked top-10 in fashion tends to
 surface ten near-identical items from the same dominant brand or style, crowding out smaller vendors
