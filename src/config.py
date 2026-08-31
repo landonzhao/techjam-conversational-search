@@ -285,6 +285,15 @@ USE_PROFILE_NEGATION_PURGE: bool = True  # OPTIONAL — mask retired profile tag
 USE_PROFILE_RANKING_FALLBACK: bool = True   # CORE — improves boundary + cold-start ranking
 PROFILE_RANKING_STRENGTH: float = 0.15      # blend: final = sat + STRENGTH * tag_overlap
 
+# Soft override demotion (ByteMe insight): when an intent override fires, old constraint phrases
+# are demoted to this weight rather than deleted. The old preference is still TRUE of the target
+# product (the evaluator builds override.old_value from the target's own soft preferences), so
+# full eviction discards valid evidence. Demotion keeps the old phrase voting at 0.3 as weak
+# corroborating signal while the new phrase dominates. ByteMe measured: intent_override MRR 0.942
+# with demote=0.3 vs full eviction. Applied to constraint_phrase_weights in dialogue state.
+# 0.0 = full eviction, 1.0 = no demotion (old accumulate-everything behaviour).
+OVERRIDE_PHRASE_DEMOTE: float = 0.3   # CORE — directly targets intent_override MRR
+
 LLM_RERANK_DEPTH: int = 20
 LLM_WEIGHT: float = 0.3
 LLM_MODEL: str = "gemini-flash-lite-latest"

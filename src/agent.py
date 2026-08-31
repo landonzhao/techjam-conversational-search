@@ -37,6 +37,7 @@ from src.config import (
     USE_SATISFACTION_RANKER,
     USE_TCRS_PHASE_SHRINKAGE, TCRS_SHRINKAGE_RATIO, TCRS_MIN_ITEM_CONF,
     USE_CE_STRUCTURED_QUERY,
+    OVERRIDE_PHRASE_DEMOTE,
 )
 from src.context_engine import (
     ContextDistiller, GuidanceLearner, OrchestrationPolicy, ProfileService,
@@ -246,6 +247,11 @@ class Agent:
     # MEASURED NEGATIVE on this dataset: full history provides product-type disambiguation context
     # the CE needs. Off by default; kept as ablation hook. See config.USE_CE_STRUCTURED_QUERY.
     USE_CE_STRUCTURED_QUERY = USE_CE_STRUCTURED_QUERY  # default False
+    # Soft override demotion (ByteMe): on intent override, multiply pre-existing constraint phrase
+    # weights by this factor instead of evicting them. The old preference is still TRUE of the target
+    # (evaluator builds old_value from the target's own soft preferences) so keeping it at partial
+    # weight preserves corroborating evidence. 0.3 = ByteMe's measured optimum.
+    OVERRIDE_PHRASE_DEMOTE = OVERRIDE_PHRASE_DEMOTE  # default 0.3
 
     # Context engine (OPTIONAL, on but UNPROVEN on the scored path). The DCP layer — session
     # distillation, long-term profiles, adaptive orchestration, guidance learning — is a
@@ -455,8 +461,26 @@ class Agent:
 
         state.accumulate(user_message, turn)
         prev_phrase_count = len(state.constraint_phrases)
-        state.constraint_phrases.extend(extract_constraints(user_message))
-        new_constraints_arrived = len(state.constraint_phrases) > prev_phrase_count
+        new_phrases = extract_constraints(user_message)
+        state.constraint_phrases.extend(new_phrases)
+        new_constraints_arrived = bool(new_phrases)
+
+        # Soft override demotion (ByteMe): when the shopper issues an intent override,
+        # reduce pre-existing constraint phrase weights to OVERRIDE_PHRASE_DEMOTE rather
+        # than evicting them. The old preference remains TRUE of the target product (the
+        # evaluator constructs override.old_value from the target's own soft preferences),
+        # so the old phrase retains residual ranking evidence at reduced influence.
+        # New phrases from this override turn get weight 1.0 (full confidence).
+        while len(state.constraint_phrase_weights) < prev_phrase_count:
+            state.constraint_phrase_weights.append(1.0)
+        if state.intent == "override" and prev_phrase_count > 0 and new_phrases:
+            for i in range(prev_phrase_count):
+                state.constraint_phrase_weights[i] *= self.OVERRIDE_PHRASE_DEMOTE
+            if self._tracer.enabled:
+                self._tracer.note(
+                    f"soft override demotion: {prev_phrase_count} old phrase(s) "
+                    f"→ weight ×{self.OVERRIDE_PHRASE_DEMOTE}")
+        state.constraint_phrase_weights.extend([1.0] * len(new_phrases))
 
         if self.USE_NEED_MODEL:
             is_override_turn = (state.intent == "override")
@@ -560,17 +584,29 @@ class Agent:
         # NeedModel positive values as ranking phrases so the ranker fires on real language. Guarded
         # to marker-absent turns, so evaluator/paraphrase sets (which carry the marker) are unchanged.
         rank_phrases = list(state.constraint_phrases)
+        # Per-phrase weights: populated only for the verbatim constraint path; NL phrases
+        # have no meaningful override history so they're always weighted equally (None).
+        rank_phrase_weights: list[float] | None = (
+            list(state.constraint_phrase_weights)
+            if len(state.constraint_phrase_weights) == len(state.constraint_phrases)
+            else None
+        )
         nl_phrases = False
         if self.USE_NL_CONSTRAINTS and not rank_phrases:
             rank_phrases = self._nl_rank_phrases(state)
+            rank_phrase_weights = None
             nl_phrases = True
 
         if self.USE_SATISFACTION_RANKER and rank_phrases:
             # Primary ranker: rank by how well candidates satisfy the disclosed phrases.
             # Lexical + semantic matching generalises over paraphrase. On NL-derived phrases,
             # popularity is suppressed so retrieval rank acts as the tie-break.
+            # phrase_weights implements soft override demotion: pre-override phrases vote at
+            # OVERRIDE_PHRASE_DEMOTE (0.3) so the new constraint dominates without discarding
+            # evidence still true of the target.
             candidates, cov_scores = self._satisfaction.rank(
-                candidates, rank_phrases, pop_weight=0.0 if nl_phrases else None)
+                candidates, rank_phrases, pop_weight=0.0 if nl_phrases else None,
+                phrase_weights=rank_phrase_weights)
             if self._tracer.enabled:
                 self._tracer.note("satisfaction rerank on phrases: "
                                   + "; ".join(rank_phrases[:6]))

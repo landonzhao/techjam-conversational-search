@@ -557,18 +557,27 @@ class NeedSatisfactionScorer:
         present = sum(self._cov._idf(t) for t in toks if t in catalog_text)
         return present / total
 
-    def score_map(self, asins: list[str], phrases: list[str]) -> dict[str, float]:
-        """Expose raw satisfaction scores for optional fusion rankers without enabling them."""
-        return self.rank(asins, phrases, pop_weight=0.0)[1]
+    def score_map(self, asins: list[str], phrases: list[str],
+                  phrase_weights: list[float] | None = None) -> dict[str, float]:
+        """Expose raw satisfaction scores for optional fusion rankers.
+
+        phrase_weights: per-phrase demotion multipliers for soft override handling.
+        """
+        return self.rank(asins, phrases, pop_weight=0.0, phrase_weights=phrase_weights)[1]
 
     def rank(self, asins: list[str], phrases: list[str],
-             pop_weight: float | None = None) -> tuple[list[str], dict[str, float]]:
+             pop_weight: float | None = None,
+             phrase_weights: list[float] | None = None) -> tuple[list[str], dict[str, float]]:
         """Return (ordered_asins, satisfaction_score_per_asin). Order preserves the incoming
         (retrieval) order on ties, so a strong retrieval placement is the natural floor.
 
         pop_weight overrides the instance popularity weight for this call (e.g. 0.0 on
         natural-language turns, where the phrases are generic regex slot values and letting
-        popularity break ties would bury a well-retrieved but unpopular target)."""
+        popularity break ties would bury a well-retrieved but unpopular target).
+        phrase_weights: per-phrase demotion weights for soft override demotion. Old constraint
+        phrases get weight < 1.0 (e.g. OVERRIDE_PHRASE_DEMOTE=0.3) so they contribute
+        residual corroborating evidence without dominating the new override constraint.
+        """
         eff_pop_weight = self.pop_weight if pop_weight is None else pop_weight
         prepared = self._cov._prepare(phrases)
         if not prepared or len(asins) <= 1:
@@ -585,12 +594,15 @@ class NeedSatisfactionScorer:
             num = den = 0.0
             top_sem = 0.0
             for j, (toks, _whole) in enumerate(prepared):
+                pw = phrase_weights[j] if phrase_weights and j < len(phrase_weights) else 1.0
                 lex = self._lexical(toks, catalog_text)
                 sem = max(0.0, row[j]) if row else 0.0
                 if sem > top_sem:
                     top_sem = sem
                 match = max(lex, self.sem_alpha * sem)
-                weight = 1.0 + COVERAGE_LEN_WEIGHT * len(toks)  # longer phrase = more specific
+                # Scale by phrase demotion weight: demoted phrases contribute residual evidence
+                # proportionally; weight=1.0 for all phrases when no demotion is active.
+                weight = (1.0 + COVERAGE_LEN_WEIGHT * len(toks)) * pw  # longer phrase = more specific
                 num += weight * match
                 den += weight
             raw = num / den if den > 0 else 0.0

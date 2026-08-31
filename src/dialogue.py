@@ -134,6 +134,7 @@ class ConversationState:
     profile_expansion_terms: set = field(default_factory=set)
     session_waveoffs: set = field(default_factory=set)
     constraint_phrases: list = field(default_factory=list)
+    constraint_phrase_weights: list[float] = field(default_factory=list)  # parallel per-phrase weights; demoted on override
     # Parallel turn metadata lets the ledger retire phrase-level simulator disclosures when a
     # repair/category switch supersedes them.  The list is optional for backwards compatibility
     # with tests/callers that assign ``constraint_phrases`` directly.
