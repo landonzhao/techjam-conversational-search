@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import glob
 import sys
+import uuid
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -37,6 +38,7 @@ app = Flask(__name__, static_folder=str(Path(__file__).parent / "static"))
 _CATALOG_PATH = str(ROOT / "data" / "catalog.jsonl")
 _catalog_index = None
 _agent = None
+_chat_sessions: dict[str, dict] = {}
 
 
 class TracingAgent(Agent):
@@ -140,6 +142,102 @@ def trace_file():
     path = _safe_path(request.args.get("path", ""))
     sessions = load_jsonl(path)[:200]
     return jsonify(sessions)
+
+
+def _chat_snapshot(agent: Agent, session_id: str, turn: dict | None = None) -> dict:
+    """Return safe, presentation-oriented state for the manual demo chat.
+
+    This is intentionally a read-only projection. It exposes decisions needed to explain the
+    system (active/retired ledger, query, route, belief, and action) without exposing a target ASIN
+    or changing the production/evaluator response contract.
+    """
+    state = agent._sessions.get(session_id)
+    if state is None:
+        return {}
+    return {
+        "intent": state.intent,
+        "buying_score": round(state.buying_score, 4),
+        "phase": state.phase,
+        "conv_state": state.conv_state,
+        "need": state.need.describe(),
+        "active_slots": {c.slot: c.value for c in state.need.positives()},
+        "active_ledger": [{
+            "operation": c.operation, "slot": c.slot, "value": c.value,
+            "polarity": c.polarity, "turn": c.turn,
+        } for c in state.need.ledger if c.active and c.polarity > 0 and c.value],
+        "retired_ledger": [{
+            "operation": c.operation, "slot": c.slot, "value": c.value,
+            "polarity": c.polarity, "turn": c.turn,
+        } for c in state.need.ledger if (not c.active or c.polarity <= 0) and c.value],
+        "excluded_terms": sorted(state.need.excluded_terms()),
+        "no_preference": sorted(state.need.no_preference),
+        "effective_query": state.query_text(),
+        "retrieval_query": state.retrieval_query(),
+        "leaky_evidence": bool(state.leaky_evidence),
+        "leaky_ranking_evidence": bool(state.leaky_ranking_evidence),
+        "pool_size": state.last_pool,
+        "belief": {
+            "confidence": round(state.belief.confidence, 4),
+            "item_confidence": round(state.belief.item_confidence, 4),
+            "margin": round(state.belief.margin, 4),
+            "entropy": round(state.belief.entropy, 4),
+            "uncertainty": {k: round(v, 4) for k, v in state.belief.attr_uncertainty.items()},
+        },
+        "ask_attribute": (turn or {}).get("stages", {}).get("response", {}).get("ask_attribute")
+        if turn else state.ig_attr,
+    }
+
+
+@app.post("/api/chat/reset")
+def chat_reset():
+    """Start a clean, non-target-aware manual demo session."""
+    body = request.get_json(silent=True) or {}
+    session_id = f"demo_{uuid.uuid4().hex}"
+    agent = get_agent()
+    # The cached tracing agent is also used by live simulation. Clear its sample cursor and start a
+    # fresh in-memory tracer so manual chat never inherits evaluator metadata or a ground truth.
+    agent._trace_samples = []
+    agent._trace_cursor = 0
+    agent._pending_meta = {}
+    agent._tracer = Tracer(enabled=True)
+    profile = {
+        "preference_tags": [str(x).strip() for x in (body.get("preference_tags") or []) if str(x).strip()],
+        "summary": str(body.get("summary") or ""),
+    }
+    agent.reset(session_id, profile)
+    _chat_sessions[session_id] = {"turn": 0, "profile": profile, "agent": agent}
+    return jsonify({"session_id": session_id, "turn": 0, "profile": profile, "state": _chat_snapshot(agent, session_id)})
+
+
+@app.post("/api/chat/respond")
+def chat_respond():
+    """Run one real Agent turn and return its response plus the presentation trace."""
+    body = request.get_json(force=True)
+    session_id = str(body.get("session_id") or "")
+    message = str(body.get("message") or "").strip()
+    session = _chat_sessions.get(session_id)
+    if not session:
+        return jsonify({"error": "chat session not found; start a new chat"}), 404
+    if not message:
+        return jsonify({"error": "message is empty"}), 400
+    if session["turn"] >= 10:
+        return jsonify({"error": "session reached the 10-turn limit"}), 400
+    agent = session["agent"]
+    session["turn"] += 1
+    turn_number = session["turn"]
+    response = agent.respond(session_id, message, turn_number, 10)
+    trace = None
+    tracer_session = getattr(agent._tracer, "_session", None)
+    if tracer_session and tracer_session.get("turns"):
+        trace = tracer_session["turns"][-1]
+    return jsonify({
+        "session_id": session_id,
+        "turn": turn_number,
+        "user_message": message,
+        "response": response,
+        "state": _chat_snapshot(agent, session_id, trace),
+        "trace": trace or {},
+    })
 
 
 @app.post("/api/simulate")

@@ -52,7 +52,7 @@ from src.retrieval import VectorRetriever, convex_fuse, rrf, vector_weight
 from src.trace import Tracer, get_tracer
 from src.understanding import (
     CatalogVocab, ExpansionTable, NeedModel, CATEGORY_CANON, MATERIAL_RE,
-    USE_CASE_KEYS,
+    USE_CASE_KEYS, resolve_category,
     SlotFiller, UseCaseInferencer, missing_required,
 )
 from src.belief import (
@@ -526,7 +526,22 @@ class Agent:
                 new_constraints_this_turn=new_constraints_arrived,
                 constraint_phrases=list(state.constraint_phrases),
                 slots={c.slot: c.value for c in state.need.positives()},
-                boundary_attrs=sorted(state.boundary_attrs))
+                boundary_attrs=sorted(state.boundary_attrs),
+                # Demo/debug projection: expose the ledger's active and retired events without
+                # changing the scored pipeline. The UI uses this to make corrections visible.
+                active_ledger=[{
+                    "operation": c.operation, "slot": c.slot, "value": c.value,
+                    "polarity": c.polarity, "turn": c.turn,
+                } for c in state.need.ledger if c.active and c.polarity > 0 and c.value],
+                retired_ledger=[{
+                    "operation": c.operation, "slot": c.slot, "value": c.value,
+                    "polarity": c.polarity, "turn": c.turn,
+                } for c in state.need.ledger if (not c.active or c.polarity <= 0) and c.value],
+                excluded_terms=sorted(state.need.excluded_terms()),
+                effective_query=state.query_text(),
+                retrieval_query=state.retrieval_query(),
+                leaky_evidence=bool(state.leaky_evidence),
+                leaky_ranking_evidence=bool(state.leaky_ranking_evidence))
 
         if self.USE_DCP and self.DCP_DISTILL:
             state.ctx = self._distiller.update(
@@ -797,6 +812,9 @@ class Agent:
                 info_gain_attr=state.ig_attr,
                 info_gain_phrasing=state.ig_phrasing)
 
+        # Build rationale from the finalized ranked order exposed in the decision trace.  Adaptive
+        # reveal/diversification below controls the API payload, while the demo inspector displays
+        # this ranked head; keeping the explanation anchored here keeps those views consistent.
         ask_attr, message = self._build_response(state, candidates, turn)
 
         if self.USE_DCP and self.DCP_PROFILE and state.profile is not None \
@@ -874,6 +892,25 @@ class Agent:
         ask_attr = next_ask(state, self.USE_INFO_GAIN_QUESTION, self.INFO_GAIN_MODE)
         template_message = compose_message(ask_attr, state, self.USE_INFO_GAIN_QUESTION)
 
+        # The information-gain selector runs before optional CE/LLM fusion, while this method
+        # receives the final ranked order.  A comparison prompt cached on ``state`` can therefore
+        # name products that are no longer the products shown in the UI (and, after a category
+        # correction, can even compare unrelated categories).  Rebuild comparison wording from
+        # the final shortlist and keep only candidates compatible with the active category.
+        if (ask_attr is not None
+                and state.ig_phrasing
+                and state.ig_phrasing.startswith("Are you looking for something more like")
+                and len(candidates) >= 2):
+            comparison_head = self._comparison_head(state, candidates)
+            if len(comparison_head) >= 2:
+                template_message = self._question_selector._comparison_phrase(comparison_head) \
+                    or compose_message(ask_attr, state, False)
+            else:
+                # Do not ask the shopper to choose between a valid item and a wrong-category
+                # decoy.  A neutral follow-up keeps the spoken action honest and lets the next
+                # turn provide a new constraint.
+                template_message = compose_message(ask_attr, state, False)
+
         # Discovery Mode: cold-start browsing with no stated preferences → present archetypes
         if (self.USE_DISCOVERY_MODE
                 and state.intent in ("browsing", "mixed", "unknown")
@@ -888,7 +925,17 @@ class Agent:
                     self._tracer.note("discovery mode: presenting product archetypes")
 
         if self.USE_REC_RATIONALE and candidates:
-            if self.USE_SNIPPET_RATIONALE:
+            top_title = str(self._catalog.products.get(candidates[0], {}).get("title") or "").lower()
+            top_category = resolve_category(top_title)
+            category_compatible = (
+                not state.need.category
+                or not top_category
+                or top_category == state.need.category
+            )
+            # Incidental words such as "running hat" can make a wrong-category item appear to
+            # satisfy a use-case.  Do not voice a positive rationale for a candidate that is
+            # provably outside the active category; the ranked cards remain inspectable instead.
+            if category_compatible and self.USE_SNIPPET_RATIONALE:
                 snippet = self._rationale.build_snippet(candidates[0], state.need)
                 if snippet:
                     template_message = f'"{snippet}" {template_message}'
@@ -896,15 +943,17 @@ class Agent:
                     why = self._rationale.build(candidates[0], state.need)
                     if why:
                         template_message = f"Top pick {why}. {template_message}"
-            else:
+            elif category_compatible:
                 why = self._rationale.build(candidates[0], state.need)
                 if why:
                     template_message = f"Top pick {why}. {template_message}"
             if self.USE_CONTRAST_RATIONALE and len(candidates) >= 2:
-                contrast = self._rationale.build_contrast(
-                    candidates[0], candidates[1], state.need)
-                if contrast:
-                    template_message = f"{template_message} {contrast}"
+                comparison_head = self._comparison_head(state, candidates)
+                if len(comparison_head) >= 2:
+                    contrast = self._rationale.build_contrast(
+                        comparison_head[0], comparison_head[1], state.need)
+                    if contrast:
+                        template_message = f"{template_message} {contrast}"
 
         if self._response_gen and self._response_gen.available:
             top_titles = [
@@ -924,6 +973,31 @@ class Agent:
             message = template_message
 
         return ask_attr, message
+
+    def _comparison_head(
+        self, state: ConversationState, candidates: list[str], limit: int = 2,
+    ) -> list[str]:
+        """Return a category-safe head for user-facing product comparisons.
+
+        Ranking intentionally keeps a broad candidate pool, and the category gate is configurable
+        for benchmark ablations.  Explanatory copy should nevertheless never offer a shirt/hat as
+        an alternative when the active need is footwear.  Unknown/sparse catalog categories are
+        retained because they cannot be proven incompatible.
+        """
+        if not candidates or limit <= 0:
+            return []
+        category = state.need.category
+        if not category:
+            return list(candidates[:limit])
+        # Only compare products that are actually at the visible ranked head.  Looking farther
+        # down for a compatible item would make the prompt name a product the shopper cannot see.
+        head = list(candidates[:limit])
+        for asin in head:
+            title = str(self._catalog.products.get(asin, {}).get("title") or "").lower()
+            candidate_category = resolve_category(title)
+            if candidate_category and candidate_category != category:
+                return []
+        return head
 
     def _reveal_count(
         self, state: ConversationState, turn: int, top_k: int, new_constraints: bool
